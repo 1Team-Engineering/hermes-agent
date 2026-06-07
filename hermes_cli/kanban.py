@@ -309,6 +309,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument("--depends-on", dest="parent", action="append",
+                          help="Dependency task id — strict alias for --parent. "
+                               "Prefer this for chain ordering; --parent is the "
+                               "older synonym retained for umbrella-only links.")
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
