@@ -2840,6 +2840,38 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+_KEEP_RUNNING_RE = re.compile(
+    r"^\s*keep_running\s*:\s*(true|yes|1)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _task_is_keep_running_umbrella(conn: sqlite3.Connection, task_id: str) -> bool:
+    """v6.4: a task with ``keep_running: true`` in its body is an
+    orchestration umbrella, not a worker task.
+
+    The dispatcher treats it specially: children promote regardless of
+    the umbrella's status (Fix A), and protocol_violation crashes do NOT
+    auto-block it (Fix B). Together this makes ``keep_running: true``
+    a state the dispatcher recognizes rather than a rule the agent must
+    obey via poll-loop.
+
+    Surfaced 2026-06-07 in v6.3 first-test: JARVIS gamed the v6.3
+    completion gate by calling kanban_block, which v6.3.1 then sealed.
+    With both terminations rejected, JARVIS exited cleanly and the
+    dispatcher's protocol_violation handler auto-blocked the umbrella
+    — defeating the gate via a different code path. v6.4 closes the
+    loop by making the dispatcher aware of orchestration umbrellas.
+    """
+    row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    body = row["body"] if "body" in row.keys() else None
+    return bool(body and _KEEP_RUNNING_RE.search(body))
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -2927,12 +2959,24 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status, t.body FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # v6.4 Fix A — children of a keep_running umbrella promote on
+            # their *other* parents' status, ignoring the umbrella entirely.
+            # An orchestration umbrella is conceptually never done; it
+            # exists to receive chain events. Forcing its status to gate
+            # child promotion was the v6.3 chain-stall bug.
+            def _parent_eligible(p) -> bool:
+                if p["status"] in ("done", "archived"):
+                    return True
+                body = p["body"] if "body" in p.keys() else None
+                if body and _KEEP_RUNNING_RE.search(body):
+                    return True
+                return False
+            if all(_parent_eligible(p) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5546,6 +5590,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 not protocol_violation
                 and _fp_counts.get(fp, 0) >= 3
             )
+            # v6.4 Fix B — protocol_violation on a keep_running umbrella is
+            # not a failure. The umbrella's job is to receive chain events,
+            # not to do worker work. JARVIS exiting cleanly when no chain
+            # event needs orchestration is the correct behavior. Skip the
+            # failure recording so the breaker doesn't trip; the umbrella
+            # stays in `ready` (already set by detect_crashed_workers
+            # earlier) and will be re-claimed on the next dispatch tick
+            # when an event lands.
+            if protocol_violation and _task_is_keep_running_umbrella(conn, tid):
+                # Already in `ready` and the protocol_violation event was
+                # already appended above. Nothing more to do — the umbrella
+                # is in "watching idle" and the dispatcher will re-spawn
+                # JARVIS when there's actually something to orchestrate.
+                continue
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,

@@ -347,6 +347,204 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# v6.4 — keep_running umbrella semantics
+# ---------------------------------------------------------------------------
+
+
+def test_recompute_ready_promotes_through_keep_running_umbrella(kanban_home):
+    """v6.4 Fix A — a child whose only non-done parent is a keep_running
+    umbrella should promote regardless of the umbrella's status.
+
+    Reproduces the v6.3 first-test stall: Banner had parents=[umbrella];
+    umbrella was `blocked` (JARVIS gave up after gates rejected both
+    completion and block); Banner sat in `todo` indefinitely. With the
+    umbrella marked keep_running, Banner promotes regardless.
+    """
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn,
+            title="v6.4 umbrella",
+            assignee="jarvis",
+            body="Orchestration test.\n\nkeep_running: true\n",
+        )
+        banner = kb.create_task(
+            conn, title="banner research", assignee="banner",
+            parents=[umbrella],
+        )
+        # Mid-chain: simulate JARVIS being in any non-done state.
+        # Banner should be ready in all of them.
+        for umbrella_status in ("ready", "running", "blocked"):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (umbrella_status, umbrella),
+            )
+            # Force banner back to todo so recompute_ready has work.
+            conn.execute(
+                "UPDATE tasks SET status='todo' WHERE id=?", (banner,)
+            )
+            conn.commit()
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, banner).status == "ready", (
+                f"banner should be ready when umbrella={umbrella_status} "
+                f"(keep_running umbrella)"
+            )
+
+
+def test_recompute_ready_does_not_promote_through_regular_parent(kanban_home):
+    """v6.4 Fix A guard rail — a child whose parent does NOT have
+    keep_running: true must still wait for that parent to complete."""
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="regular parent", assignee="banner",
+            body="No keep_running marker here.",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="friday", parents=[parent],
+        )
+        for parent_status in ("ready", "running", "blocked"):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (parent_status, parent),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='todo' WHERE id=?", (child,)
+            )
+            conn.commit()
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo", (
+                f"child should NOT promote when parent={parent_status} "
+                f"and parent is not keep_running"
+            )
+
+
+def test_recompute_ready_mixed_keep_running_and_regular_parents(kanban_home):
+    """v6.4 Fix A — child with both a keep_running umbrella AND a regular
+    parent must wait for the regular parent to be done; the umbrella's
+    status is ignored either way."""
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        upstream = kb.create_task(
+            conn, title="upstream", assignee="banner",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="friday",
+            parents=[umbrella, upstream],
+        )
+        # Umbrella in any status + upstream not done → child stays todo
+        for umbrella_status in ("running", "blocked"):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (umbrella_status, umbrella),
+            )
+            conn.commit()
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo"
+        # Once upstream completes, child promotes regardless of umbrella
+        kb.claim_task(conn, upstream)
+        kb.complete_task(conn, upstream, summary="done")
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def _simulate_clean_exit(monkeypatch, pid: int):
+    """Force _classify_worker_exit to return ('clean_exit', 0) for this
+    pid AND make _pid_alive say the pid is dead.
+
+    Bypasses the real os.waitpid reap registry so tests don't depend on
+    racy subprocess teardown."""
+    from hermes_cli import kanban_db as _kb
+    real_classify = _kb._classify_worker_exit
+    real_alive = _kb._pid_alive
+
+    def fake_classify(p):
+        if int(p) == int(pid):
+            return ("clean_exit", 0)
+        return real_classify(p)
+
+    def fake_alive(p):
+        if int(p or 0) == int(pid):
+            return False
+        return real_alive(p)
+
+    monkeypatch.setattr(_kb, "_classify_worker_exit", fake_classify)
+    monkeypatch.setattr(_kb, "_pid_alive", fake_alive)
+
+
+def test_protocol_violation_on_keep_running_umbrella_does_not_auto_block(
+    kanban_home, monkeypatch,
+):
+    """v6.4 Fix B — when a keep_running umbrella's worker exits cleanly
+    without calling complete/block, the dispatcher must NOT auto-block
+    the umbrella. The protocol_violation event still fires (audit) but
+    the umbrella stays in `ready` for the next dispatch tick.
+    """
+    fake_pid = 999_999  # a pid that won't exist
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="v6.4 umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        kb.claim_task(conn, umbrella)
+        # Pre-date started_at past the grace window so the liveness
+        # check actually runs.
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (fake_pid, 0, umbrella),
+        )
+        conn.commit()
+    _simulate_clean_exit(monkeypatch, fake_pid)
+    with kb.connect() as conn:
+        crashed = kb.detect_crashed_workers(conn)
+        assert umbrella in crashed
+        status = kb.get_task(conn, umbrella).status
+        assert status == "ready", (
+            f"keep_running umbrella should stay ready after protocol "
+            f"violation; got status={status}"
+        )
+        rows = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 5",
+            (umbrella,),
+        ).fetchall()
+        event_kinds = [r["kind"] for r in rows]
+        assert "protocol_violation" in event_kinds, (
+            f"expected protocol_violation event; got {event_kinds}"
+        )
+
+
+def test_protocol_violation_on_regular_task_still_auto_blocks(
+    kanban_home, monkeypatch,
+):
+    """v6.4 Fix B guard rail — a non-keep_running task's clean-exit
+    protocol violation still trips the breaker as before."""
+    fake_pid = 999_998
+    with kb.connect() as conn:
+        task = kb.create_task(
+            conn, title="regular worker task", assignee="friday",
+            body="No keep_running here.",
+        )
+        kb.claim_task(conn, task)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (fake_pid, 0, task),
+        )
+        conn.commit()
+    _simulate_clean_exit(monkeypatch, fake_pid)
+    with kb.connect() as conn:
+        crashed = kb.detect_crashed_workers(conn)
+        assert task in crashed
+        status = kb.get_task(conn, task).status
+        # Regular tasks: protocol_violation forces failure_limit=1, so
+        # the task auto-blocks immediately.
+        assert status == "blocked", (
+            f"regular task should auto-block after protocol violation; "
+            f"got status={status}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
 
