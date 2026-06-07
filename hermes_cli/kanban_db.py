@@ -2845,6 +2845,28 @@ _KEEP_RUNNING_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# v6.5.1 — Review task detection for the "review-needs-build-parent" gate.
+# Mirrors the verdict-gate detection in tools/kanban_tools.py so a task
+# classified as a "review task" in one place is classified the same way
+# in the other. The set/regex must stay in sync if either changes.
+_REVIEWER_PROFILES_DB = frozenset({"tony", "tchalla", "vision", "elon"})
+_REVIEW_KEYWORD_RE = re.compile(
+    r"\b(review|verify|audit|inspect|smoke[- ]?test|qa)\b", re.IGNORECASE
+)
+
+
+def _is_review_task(assignee: Optional[str], title: Optional[str], body: Optional[str]) -> bool:
+    """True when the task should be subject to v6.5.1 review-dep enforcement.
+
+    Mirrors tools/kanban_tools._check_reviewer_verdict_gate detection:
+    a task is "a review task" iff its assignee is a reviewer profile AND
+    its title or body mentions a review keyword.
+    """
+    if not assignee or assignee.lower() not in _REVIEWER_PROFILES_DB:
+        return False
+    haystack = ((title or "") + " " + (body or "")).strip()
+    return bool(_REVIEW_KEYWORD_RE.search(haystack))
+
 
 def _task_is_keep_running_umbrella(conn: sqlite3.Connection, task_id: str) -> bool:
     """v6.4: a task with ``keep_running: true`` in its body is an
@@ -3066,6 +3088,77 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # v6.5.1 — Review tasks must have at least one non-review parent.
+        # Surfaced in v6.5 first-test: Pepper created reviewer tasks
+        # (Tony/Tchalla/Vision Block X review) with empty parents. The
+        # tasks promoted immediately, ran against an empty (or stale)
+        # workspace, and Vision used verdict: approve with fabricated
+        # evidence ("13/13 tests pass" when no tests existed). The
+        # verdict gate in kanban_tools forces a verdict PREFIX but
+        # doesn't validate the verdict reflects reality. The structural
+        # fix is to refuse promotion until the review has something
+        # buildy to review against.
+        self_row = conn.execute(
+            "SELECT assignee, title, body FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if self_row and _is_review_task(
+            self_row["assignee"],
+            self_row["title"] if "title" in self_row.keys() else None,
+            self_row["body"] if "body" in self_row.keys() else None,
+        ):
+            parent_rows = conn.execute(
+                "SELECT p.id, p.assignee, p.title, p.body FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            has_non_review_parent = any(
+                not _is_review_task(
+                    p["assignee"],
+                    p["title"] if "title" in p.keys() else None,
+                    p["body"] if "body" in p.keys() else None,
+                )
+                for p in parent_rows
+            )
+            # Also skip the umbrella check: an umbrella is technically a
+            # non-review parent, but it doesn't represent buildable
+            # output. Require at least one non-umbrella non-review parent.
+            has_non_umbrella_non_review_parent = any(
+                not _is_review_task(
+                    p["assignee"],
+                    p["title"] if "title" in p.keys() else None,
+                    p["body"] if "body" in p.keys() else None,
+                )
+                and not (
+                    p["body"] and _KEEP_RUNNING_RE.search(p["body"])
+                )
+                for p in parent_rows
+            )
+            if not has_non_umbrella_non_review_parent:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "last_failure_error = ? "
+                    "WHERE id = ? AND status = 'ready'",
+                    (
+                        "v6.5.1 gate: review task has no non-review, "
+                        "non-umbrella parent — the corresponding build "
+                        "task must be linked via --depends-on so this "
+                        "review runs against actual deliverables instead "
+                        "of an empty workspace. See kanban-orchestration "
+                        "skill § Pepper Chain Integrity.",
+                        task_id,
+                    ),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {
+                        "reason": "review_missing_build_parent",
+                        "parent_count": len(parent_rows),
+                        "non_review_parent": has_non_review_parent,
+                    },
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant

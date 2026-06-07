@@ -579,6 +579,102 @@ def test_protocol_violation_on_keep_running_umbrella_does_not_auto_block(
         )
 
 
+def test_review_task_with_no_parents_cannot_claim(kanban_home):
+    """v6.5.1 gate — review tasks must have a non-review parent.
+
+    Reproduces v6.5 first-test: Pepper created Vision Block A review
+    with parents=[]. Vision claimed within seconds, ran against an
+    empty workspace, fabricated evidence in her summary, and used
+    `verdict: approve`. The verdict gate forced the prefix but
+    couldn't validate the verdict reflected reality. Structural fix:
+    refuse to claim a review task that has no real build parent.
+    """
+    with kb.connect() as conn:
+        review = kb.create_task(
+            conn,
+            title="Block A review (vision) — v6.5 chain integrity",
+            assignee="vision",
+            body="Review Block A per the spec.",
+        )
+        # Force ready (no parents)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (review,))
+        conn.commit()
+        claimed = kb.claim_task(conn, review)
+        assert claimed is None, (
+            "review task with no parents must not be claimable"
+        )
+        # And it should be blocked with the v6.5.1 reason.
+        task = kb.get_task(conn, review)
+        assert task.status == "blocked"
+        assert task.last_failure_error and "v6.5.1 gate" in task.last_failure_error
+
+
+def test_review_task_with_umbrella_parent_only_cannot_claim(kanban_home):
+    """v6.5.1 gate — even with a keep_running umbrella parent, a review
+    task needs a non-umbrella, non-review build parent to claim.
+
+    Otherwise the v6.4 keep_running umbrella semantics would let any
+    review task promote against just an umbrella + no real build.
+    """
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="orchestration umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        review = kb.create_task(
+            conn,
+            title="Block B review (tony) — v6.5 chain integrity",
+            assignee="tony",
+            body="Review Block B code.",
+            parents=[umbrella],
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (review,))
+        conn.commit()
+        claimed = kb.claim_task(conn, review)
+        assert claimed is None
+        assert kb.get_task(conn, review).status == "blocked"
+
+
+def test_review_task_with_build_parent_can_claim(kanban_home):
+    """v6.5.1 gate — guard rail. Review task linked to its build task
+    (via --depends-on) promotes normally when the build is done."""
+    with kb.connect() as conn:
+        build = kb.create_task(
+            conn, title="Block A — Shuri: backend",
+            assignee="shuri",
+            body="Build the backend.",
+        )
+        kb.claim_task(conn, build)
+        kb.complete_task(conn, build, summary="block A shipped")
+        review = kb.create_task(
+            conn,
+            title="Block A review (tony) — v6.5 chain integrity",
+            assignee="tony",
+            body="Review Block A code per your SOUL.",
+            parents=[build],
+        )
+        # Build is done so review should promote
+        assert kb.get_task(conn, review).status == "ready"
+        claimed = kb.claim_task(conn, review)
+        assert claimed is not None, "review with done build parent must claim"
+        assert kb.get_task(conn, review).status == "running"
+
+
+def test_non_review_task_not_subject_to_v6_5_1_gate(kanban_home):
+    """v6.5.1 gate guard rail — non-review tasks (build, research, etc.)
+    are not subject to the build-parent requirement."""
+    with kb.connect() as conn:
+        # Build task with no parents — should claim normally
+        build = kb.create_task(
+            conn, title="Block A — Shuri: backend",
+            assignee="shuri",
+            body="Build the backend.",
+        )
+        # create_task starts at 'ready' so this can claim immediately
+        claimed = kb.claim_task(conn, build)
+        assert claimed is not None
+
+
 def test_skill_available_finds_canonical_locations(kanban_home):
     """v6.5 — _skill_available finds skills in canonical locations
     (devops/, qa/, ui-ux/) AND via bounded rglob fallback."""
