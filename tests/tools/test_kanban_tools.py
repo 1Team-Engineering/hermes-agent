@@ -397,6 +397,403 @@ def test_complete_with_result_only(worker_env):
     assert d["ok"] is True
 
 
+# ---------------------------------------------------------------------------
+# v6.3 completion gates — verdict, evidence-path, keep_running
+# ---------------------------------------------------------------------------
+
+
+def _make_task(monkeypatch, tmp_path, *, assignee, title, body):
+    """Helper: spin up a kanban DB and create a fresh task in `running` state.
+
+    Returns the task id (which is also set as HERMES_KANBAN_TASK so the
+    handler defaults to this task).
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", assignee)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title=title, body=body, assignee=assignee)
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def test_verdict_gate_fires_on_review_task_without_verdict(monkeypatch, tmp_path):
+    tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="tony",
+        title="tony review Block A",
+        body="Review Block A code quality.",
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "looks good"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "verdict" in d["error"].lower()
+    assert tid in d["error"]
+
+
+def test_verdict_gate_passes_on_explicit_verdict(monkeypatch, tmp_path):
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="tony",
+        title="tony review Block A",
+        body="Review Block A code quality.",
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "result": "verdict: approve",
+        "summary": "All gates pass on Block A.",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
+def test_verdict_gate_passes_on_reject(monkeypatch, tmp_path):
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="tchalla",
+        title="tchalla review Block A",
+        body="Review Block A test strategy.",
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "result": "verdict: reject",
+        "metadata": {"reasons": ["tests exercise fallback, not real binding"]},
+    })
+    assert json.loads(out).get("ok") is True
+
+
+def test_verdict_gate_bypasses_non_reviewer(monkeypatch, tmp_path):
+    """Friday's build task should NOT require a verdict prefix."""
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday Block A",
+        body="Wire the 4 routes per Pepper's spec.",
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "shipped Block A on wt/fix-13-block-a"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_verdict_gate_bypasses_reviewer_on_non_review_task(monkeypatch, tmp_path):
+    """A reviewer profile can do non-review work without a verdict prefix.
+
+    Example: Vision builds UI (assigned to vision but task is not a review).
+    """
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="vision",
+        title="vision build: 4 UI components",
+        body="Implement BlockA components per Pepper's spec.",
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "Built 4 components with token-checked styles"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_evidence_path_gate_fires_when_paths_missing(monkeypatch, tmp_path):
+    body = (
+        "Build task with smoke check.\n\n"
+        "required_evidence_paths:\n"
+        "  - /tmp/v6-3-test-missing.log\n"
+        "  - /tmp/v6-3-test-also-missing.txt\n"
+    )
+    tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday Block A",
+        body=body,
+    )
+    # Belt-and-suspenders: ensure the paths really don't exist.
+    for p in ("/tmp/v6-3-test-missing.log", "/tmp/v6-3-test-also-missing.txt"):
+        if os.path.exists(p):
+            os.unlink(p)
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "smoke check done (allegedly)"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "evidence" in d["error"].lower() or "required" in d["error"].lower()
+    assert tid in d["error"]
+
+
+def test_evidence_path_gate_passes_when_paths_exist(monkeypatch, tmp_path):
+    p1 = tmp_path / "smoke-dev.log"
+    p2 = tmp_path / "smoke-curls.txt"
+    p1.write_text("Server ready")
+    p2.write_text("/ 200\n/cycle-budget 200")
+    body = (
+        "Build task with smoke check.\n\n"
+        f"required_evidence_paths:\n"
+        f"  - {p1}\n"
+        f"  - {p2}\n"
+    )
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday Block A",
+        body=body,
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "smoke check actually done"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_evidence_path_gate_treats_empty_files_as_failure(monkeypatch, tmp_path):
+    empty = tmp_path / "empty-screenshot.png"
+    empty.touch()
+    body = f"required_evidence_paths:\n  - {empty}\n"
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday Block A",
+        body=body,
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "empty file shouldn't count"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "empty" in d["error"].lower()
+
+
+def test_evidence_path_gate_bypasses_when_no_declaration(monkeypatch, tmp_path):
+    """Tasks without a required_evidence_paths: block pass cleanly."""
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday simple fix",
+        body="One-line bugfix; no artifacts required.",
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "shipped"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_keep_running_gate_fires_when_descendants_active(monkeypatch, tmp_path):
+    """An umbrella with keep_running: true cannot complete while a child
+    is non-terminal."""
+    body = (
+        "v6.3 test umbrella.\n\n"
+        "keep_running: true\n"
+    )
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="v6.3 test umbrella",
+        body=body,
+    )
+    # Create a live child linked to the umbrella.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.create_task(conn, title="child task", assignee="friday")
+        kb.link_tasks(conn, parent_tid, child)
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "trying to close umbrella early"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "keep_running" in d["error"] or "descendant" in d["error"]
+    assert parent_tid in d["error"]
+
+
+def test_keep_running_gate_passes_when_all_children_terminal(monkeypatch, tmp_path):
+    body = "keep_running: true\n"
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="v6.3 test umbrella",
+        body=body,
+    )
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.create_task(conn, title="child task", assignee="friday")
+        kb.link_tasks(conn, parent_tid, child)
+        # Force the child into a terminal state directly (the test-only
+        # path; tooling-level complete_task requires run-id coordination
+        # we don't need to replicate here).
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = strftime('%s','now') "
+            "WHERE id = ?", (child,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "all children terminal; closing umbrella"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_keep_running_gate_tenant_walk_finds_unlinked_siblings(monkeypatch, tmp_path):
+    """v6.6 — when the umbrella has a tenant set, the gate walks by
+    tenant instead of task_links. Closes the v6.5.1 stall route where
+    Pepper-shaped chains don't link build tasks back to the umbrella —
+    Shuri/Vision/Friday tasks have parents=[chain-predecessor] not
+    parents=[umbrella, ...]. The umbrella's task_links would only find
+    Banner+Pepper directly. Tenant scoping finds the whole chain.
+    """
+    body = "keep_running: true\n"
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="v6.6 umbrella",
+        body=body,
+    )
+    # Tag both the umbrella AND a sibling task with the same tenant,
+    # and DO NOT link them via task_links — simulates Pepper's chain
+    # shape (build tasks have parents pointing at chain predecessors,
+    # not back at the umbrella).
+    tenant = "marvel-swarm-v6-6-tenant-walk-test"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET tenant=? WHERE id=?", (tenant, parent_tid))
+        # Create a sibling in the same tenant, unlinked
+        sibling = kb.create_task(
+            conn, title="orphan build task", assignee="shuri",
+            tenant=tenant,
+        )
+        # No kb.link_tasks call — just same tenant
+        conn.commit()
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "trying to close while tenant has live work"})
+    d = json.loads(out)
+    assert "error" in d, f"expected tenant-scoped gate to reject; got: {d}"
+    assert "tenant" in d["error"].lower()
+    assert parent_tid in d["error"]
+
+
+def test_keep_running_gate_bypasses_when_no_marker(monkeypatch, tmp_path):
+    """An umbrella without keep_running: true closes normally even with live
+    descendants — opt-in semantics."""
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="legacy umbrella",
+        body="No keep_running marker — older orchestration pattern.",
+    )
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.create_task(conn, title="child task", assignee="friday")
+        kb.link_tasks(conn, parent_tid, child)
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "closing legacy umbrella"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_keep_running_gate_fires_on_block_too(monkeypatch, tmp_path):
+    """v6.3.1 hotfix — kanban_block on a keep_running umbrella with a live
+    child must be rejected (same way as kanban_complete).
+
+    Surfaced 2026-06-07 when JARVIS routed around the v6.3 keep_running
+    completion gate by calling kanban_block on the umbrella with reason
+    'awaiting-async-event'. The umbrella transitioned to `blocked`, the
+    dispatcher refused to promote children of a blocked parent, and the
+    chain stalled. Block must enforce the same descendants-terminal rule
+    that complete enforces.
+
+    The verdict and evidence-path gates stay completion-only — a reviewer
+    blocking on infra and a builder blocking honestly on missing artifacts
+    are both legitimate uses of kanban_block.
+    """
+    body = "keep_running: true\n"
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="v6.3.1 umbrella",
+        body=body,
+    )
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.create_task(conn, title="live child", assignee="friday")
+        kb.link_tasks(conn, parent_tid, child)
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "awaiting-async-event"})
+    d = json.loads(out)
+    assert "error" in d, f"expected block to be rejected; got: {d}"
+    assert "keep_running" in d["error"] or "descendant" in d["error"]
+    assert parent_tid in d["error"]
+
+
+def test_block_passes_on_non_umbrella(monkeypatch, tmp_path):
+    """Non-umbrella tasks (no keep_running marker) can block normally —
+    e.g. Friday blocking honestly because he can't produce an artifact."""
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday Block A",
+        body=(
+            "Build the routes.\n\n"
+            "required_evidence_paths:\n"
+            "  - /tmp/v6-3-1-evidence-not-yet.log\n"
+        ),
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "evidence: /tmp/v6-3-1-evidence-not-yet.log could not be produced because dev server crashed",
+    })
+    assert json.loads(out).get("ok") is True
+
+
+def test_depends_on_alias_appears_in_create_help():
+    """--depends-on is exposed alongside --parent on `hermes kanban create`.
+
+    Smoke test: build the argparse subparser locally and assert both flags
+    are wired with the same dest. The gate runs before any DB work.
+    """
+    import argparse
+    # Build a fresh parser mirroring the production setup, then introspect.
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    p_create = sub.add_parser("create")
+    p_create.add_argument("title")
+    p_create.add_argument("--parent", action="append", default=[])
+    p_create.add_argument("--depends-on", dest="parent", action="append")
+    # Confirm both flags route to args.parent.
+    args = parser.parse_args(["create", "title", "--parent", "t_aaa",
+                              "--depends-on", "t_bbb"])
+    assert args.parent == ["t_aaa", "t_bbb"]
+
+    # And confirm the actual production module exposes the flag in --help.
+    import io, contextlib
+    import argparse as ap
+    from hermes_cli import kanban as kbcli
+    root = ap.ArgumentParser(prog="hermes")
+    root_sub = root.add_subparsers(dest="kanban_action")
+    kbcli.build_parser(root_sub)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            root.parse_args(["kanban", "create", "--help"])
+        except SystemExit:
+            pass
+    out = buf.getvalue()
+    assert "--depends-on" in out, f"expected --depends-on in help; got: {out[:500]}"
+    assert "--parent" in out
+
+
 def test_complete_with_artifacts_lands_in_event_payload(worker_env):
     """``artifacts=[...]`` rides into the completed event payload so the
     gateway notifier can upload them as native attachments. See the

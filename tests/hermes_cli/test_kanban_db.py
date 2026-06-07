@@ -347,6 +347,442 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# v6.4 — keep_running umbrella semantics
+# ---------------------------------------------------------------------------
+
+
+def test_recompute_ready_promotes_through_keep_running_umbrella(kanban_home):
+    """v6.4 Fix A — a child whose only non-done parent is a keep_running
+    umbrella should promote regardless of the umbrella's status.
+
+    Reproduces the v6.3 first-test stall: Banner had parents=[umbrella];
+    umbrella was `blocked` (JARVIS gave up after gates rejected both
+    completion and block); Banner sat in `todo` indefinitely. With the
+    umbrella marked keep_running, Banner promotes regardless.
+    """
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn,
+            title="v6.4 umbrella",
+            assignee="jarvis",
+            body="Orchestration test.\n\nkeep_running: true\n",
+        )
+        banner = kb.create_task(
+            conn, title="banner research", assignee="banner",
+            parents=[umbrella],
+        )
+        # Mid-chain: simulate JARVIS being in any non-done state.
+        # Banner should be ready in all of them.
+        for umbrella_status in ("ready", "running", "blocked"):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (umbrella_status, umbrella),
+            )
+            # Force banner back to todo so recompute_ready has work.
+            conn.execute(
+                "UPDATE tasks SET status='todo' WHERE id=?", (banner,)
+            )
+            conn.commit()
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, banner).status == "ready", (
+                f"banner should be ready when umbrella={umbrella_status} "
+                f"(keep_running umbrella)"
+            )
+
+
+def test_claim_task_allows_keep_running_umbrella_parent(kanban_home):
+    """v6.4 Fix A extended — claim_task's parents-not-done invariant
+    must also recognize keep_running umbrellas, otherwise a child
+    promoted by recompute_ready gets demoted back to `todo` on the
+    first claim attempt.
+
+    Surfaced 2026-06-07 in v6.4 first-test: Banner kept getting promoted
+    (Fix A worked in recompute_ready) and then claim_rejected with
+    reason: parents_not_done (Fix A missing from claim_task). The
+    invariant cycle prevented Banner from ever running.
+    """
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="v6.4 umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        banner = kb.create_task(
+            conn, title="banner research", assignee="banner",
+            parents=[umbrella],
+        )
+        # Force umbrella running (a real chain state, not done).
+        conn.execute(
+            "UPDATE tasks SET status='running' WHERE id=?",
+            (umbrella,),
+        )
+        # Force banner ready (post-recompute_ready state).
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (banner,)
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, banner)
+        assert claimed is not None, (
+            "Banner should be claimable when umbrella is keep_running, "
+            "even if umbrella is `running` (not done)"
+        )
+        assert kb.get_task(conn, banner).status == "running"
+
+
+def test_claim_task_still_blocks_undone_regular_parent(kanban_home):
+    """v6.4 Fix A guard rail — claim_task still demotes a child whose
+    regular (non-keep_running) parent is undone."""
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="regular parent", assignee="banner",
+            body="No keep_running here.",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="friday", parents=[parent],
+        )
+        # Force statuses: parent running (not done), child ready.
+        conn.execute(
+            "UPDATE tasks SET status='running' WHERE id=?", (parent,)
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (child,)
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, child)
+        assert claimed is None, (
+            "child should NOT be claimable when regular parent is running"
+        )
+        # And the invariant demoted it back.
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_recompute_ready_does_not_promote_through_regular_parent(kanban_home):
+    """v6.4 Fix A guard rail — a child whose parent does NOT have
+    keep_running: true must still wait for that parent to complete."""
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="regular parent", assignee="banner",
+            body="No keep_running marker here.",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="friday", parents=[parent],
+        )
+        for parent_status in ("ready", "running", "blocked"):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (parent_status, parent),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='todo' WHERE id=?", (child,)
+            )
+            conn.commit()
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo", (
+                f"child should NOT promote when parent={parent_status} "
+                f"and parent is not keep_running"
+            )
+
+
+def test_recompute_ready_mixed_keep_running_and_regular_parents(kanban_home):
+    """v6.4 Fix A — child with both a keep_running umbrella AND a regular
+    parent must wait for the regular parent to be done; the umbrella's
+    status is ignored either way."""
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        upstream = kb.create_task(
+            conn, title="upstream", assignee="banner",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="friday",
+            parents=[umbrella, upstream],
+        )
+        # Umbrella in any status + upstream not done → child stays todo
+        for umbrella_status in ("running", "blocked"):
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (umbrella_status, umbrella),
+            )
+            conn.commit()
+            kb.recompute_ready(conn)
+            assert kb.get_task(conn, child).status == "todo"
+        # Once upstream completes, child promotes regardless of umbrella
+        kb.claim_task(conn, upstream)
+        kb.complete_task(conn, upstream, summary="done")
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def _simulate_clean_exit(monkeypatch, pid: int):
+    """Force _classify_worker_exit to return ('clean_exit', 0) for this
+    pid AND make _pid_alive say the pid is dead.
+
+    Bypasses the real os.waitpid reap registry so tests don't depend on
+    racy subprocess teardown."""
+    from hermes_cli import kanban_db as _kb
+    real_classify = _kb._classify_worker_exit
+    real_alive = _kb._pid_alive
+
+    def fake_classify(p):
+        if int(p) == int(pid):
+            return ("clean_exit", 0)
+        return real_classify(p)
+
+    def fake_alive(p):
+        if int(p or 0) == int(pid):
+            return False
+        return real_alive(p)
+
+    monkeypatch.setattr(_kb, "_classify_worker_exit", fake_classify)
+    monkeypatch.setattr(_kb, "_pid_alive", fake_alive)
+
+
+def test_protocol_violation_on_keep_running_umbrella_does_not_auto_block(
+    kanban_home, monkeypatch,
+):
+    """v6.4 Fix B — when a keep_running umbrella's worker exits cleanly
+    without calling complete/block, the dispatcher must NOT auto-block
+    the umbrella. The protocol_violation event still fires (audit) but
+    the umbrella stays in `ready` for the next dispatch tick.
+    """
+    fake_pid = 999_999  # a pid that won't exist
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="v6.4 umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        kb.claim_task(conn, umbrella)
+        # Pre-date started_at past the grace window so the liveness
+        # check actually runs.
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (fake_pid, 0, umbrella),
+        )
+        conn.commit()
+    _simulate_clean_exit(monkeypatch, fake_pid)
+    with kb.connect() as conn:
+        crashed = kb.detect_crashed_workers(conn)
+        assert umbrella in crashed
+        status = kb.get_task(conn, umbrella).status
+        assert status == "ready", (
+            f"keep_running umbrella should stay ready after protocol "
+            f"violation; got status={status}"
+        )
+        rows = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 5",
+            (umbrella,),
+        ).fetchall()
+        event_kinds = [r["kind"] for r in rows]
+        assert "protocol_violation" in event_kinds, (
+            f"expected protocol_violation event; got {event_kinds}"
+        )
+
+
+def test_review_task_with_no_parents_cannot_claim(kanban_home):
+    """v6.5.1 gate — review tasks must have a non-review parent.
+
+    Reproduces v6.5 first-test: Pepper created Vision Block A review
+    with parents=[]. Vision claimed within seconds, ran against an
+    empty workspace, fabricated evidence in her summary, and used
+    `verdict: approve`. The verdict gate forced the prefix but
+    couldn't validate the verdict reflected reality. Structural fix:
+    refuse to claim a review task that has no real build parent.
+    """
+    with kb.connect() as conn:
+        review = kb.create_task(
+            conn,
+            title="Block A review (vision) — v6.5 chain integrity",
+            assignee="vision",
+            body="Review Block A per the spec.",
+        )
+        # Force ready (no parents)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (review,))
+        conn.commit()
+        claimed = kb.claim_task(conn, review)
+        assert claimed is None, (
+            "review task with no parents must not be claimable"
+        )
+        # And it should be blocked with the v6.5.1 reason.
+        task = kb.get_task(conn, review)
+        assert task.status == "blocked"
+        assert task.last_failure_error and "v6.5.1 gate" in task.last_failure_error
+
+
+def test_review_task_with_umbrella_parent_only_cannot_claim(kanban_home):
+    """v6.5.1 gate — even with a keep_running umbrella parent, a review
+    task needs a non-umbrella, non-review build parent to claim.
+
+    Otherwise the v6.4 keep_running umbrella semantics would let any
+    review task promote against just an umbrella + no real build.
+    """
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="orchestration umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        review = kb.create_task(
+            conn,
+            title="Block B review (tony) — v6.5 chain integrity",
+            assignee="tony",
+            body="Review Block B code.",
+            parents=[umbrella],
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (review,))
+        conn.commit()
+        claimed = kb.claim_task(conn, review)
+        assert claimed is None
+        assert kb.get_task(conn, review).status == "blocked"
+
+
+def test_review_task_with_build_parent_can_claim(kanban_home):
+    """v6.5.1 gate — guard rail. Review task linked to its build task
+    (via --depends-on) promotes normally when the build is done."""
+    with kb.connect() as conn:
+        build = kb.create_task(
+            conn, title="Block A — Shuri: backend",
+            assignee="shuri",
+            body="Build the backend.",
+        )
+        kb.claim_task(conn, build)
+        kb.complete_task(conn, build, summary="block A shipped")
+        review = kb.create_task(
+            conn,
+            title="Block A review (tony) — v6.5 chain integrity",
+            assignee="tony",
+            body="Review Block A code per your SOUL.",
+            parents=[build],
+        )
+        # Build is done so review should promote
+        assert kb.get_task(conn, review).status == "ready"
+        claimed = kb.claim_task(conn, review)
+        assert claimed is not None, "review with done build parent must claim"
+        assert kb.get_task(conn, review).status == "running"
+
+
+def test_non_review_task_not_subject_to_v6_5_1_gate(kanban_home):
+    """v6.5.1 gate guard rail — non-review tasks (build, research, etc.)
+    are not subject to the build-parent requirement."""
+    with kb.connect() as conn:
+        # Build task with no parents — should claim normally
+        build = kb.create_task(
+            conn, title="Block A — Shuri: backend",
+            assignee="shuri",
+            body="Build the backend.",
+        )
+        # create_task starts at 'ready' so this can claim immediately
+        claimed = kb.claim_task(conn, build)
+        assert claimed is not None
+
+
+def test_skill_available_finds_canonical_locations(kanban_home):
+    """v6.5 — _skill_available finds skills in canonical locations
+    (devops/, qa/, ui-ux/) AND via bounded rglob fallback."""
+    from hermes_cli.kanban_db import _skill_available
+    import os, pathlib
+    home = pathlib.Path(os.environ["HERMES_HOME"])
+    skills_root = home / "skills"
+
+    # Build a fake skill in the devops/ canonical layout
+    devops_skill = skills_root / "devops" / "my-skill" / "SKILL.md"
+    devops_skill.parent.mkdir(parents=True, exist_ok=True)
+    devops_skill.write_text("# my-skill")
+    assert _skill_available(str(home), "my-skill")
+
+    # And in a non-canonical nested layout
+    nested_skill = skills_root / "tenants" / "acme" / "deep-skill" / "SKILL.md"
+    nested_skill.parent.mkdir(parents=True, exist_ok=True)
+    nested_skill.write_text("# deep-skill")
+    assert _skill_available(str(home), "deep-skill")
+
+    # Missing skill returns False (this is the spawn-crash mitigation)
+    assert not _skill_available(str(home), "kanban-orchestration"), (
+        "kanban-orchestration should NOT be in this test profile's skills dir; "
+        "the dispatcher must filter it from --skills flags before spawn"
+    )
+
+
+def test_real_crash_on_keep_running_umbrella_does_not_auto_block(
+    kanban_home, monkeypatch,
+):
+    """v6.4 Fix B (expanded) — ANY crash on a keep_running umbrella,
+    not just protocol violations, leaves the breaker untripped.
+
+    Surfaced 2026-06-07 01:00 in the v6.4 first-test: JARVIS's
+    orchestration worker hit a real crash (not clean exit) on the
+    second tick. The original Fix B only covered clean_exit;
+    real-crash routes through the normal failure handler and tripped
+    the breaker at limit=2, blocking the umbrella anyway.
+
+    Pathological repeated crashes still leave a paper trail; the
+    operator can still inspect via the crashed event sequence. But
+    the chain doesn't stall on the umbrella's behalf.
+    """
+    fake_pid = 999_997
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="v6.4 umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        kb.claim_task(conn, umbrella)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (fake_pid, 0, umbrella),
+        )
+        conn.commit()
+    # Simulate a real crash (nonzero exit), not a clean exit.
+    from hermes_cli import kanban_db as _kb
+    real_classify = _kb._classify_worker_exit
+    real_alive = _kb._pid_alive
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit",
+        lambda p: ("nonzero_exit", 1) if int(p) == fake_pid else real_classify(p),
+    )
+    monkeypatch.setattr(
+        _kb, "_pid_alive",
+        lambda p: False if int(p or 0) == fake_pid else real_alive(p),
+    )
+    with kb.connect() as conn:
+        crashed = kb.detect_crashed_workers(conn)
+        assert umbrella in crashed
+        status = kb.get_task(conn, umbrella).status
+        assert status == "ready", (
+            f"keep_running umbrella should stay ready after ANY crash; "
+            f"got status={status}"
+        )
+
+
+def test_protocol_violation_on_regular_task_still_auto_blocks(
+    kanban_home, monkeypatch,
+):
+    """v6.4 Fix B guard rail — a non-keep_running task's clean-exit
+    protocol violation still trips the breaker as before."""
+    fake_pid = 999_998
+    with kb.connect() as conn:
+        task = kb.create_task(
+            conn, title="regular worker task", assignee="friday",
+            body="No keep_running here.",
+        )
+        kb.claim_task(conn, task)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (fake_pid, 0, task),
+        )
+        conn.commit()
+    _simulate_clean_exit(monkeypatch, fake_pid)
+    with kb.connect() as conn:
+        crashed = kb.detect_crashed_workers(conn)
+        assert task in crashed
+        status = kb.get_task(conn, task).status
+        # Regular tasks: protocol_violation forces failure_limit=1, so
+        # the task auto-blocks immediately.
+        assert status == "blocked", (
+            f"regular task should auto-block after protocol violation; "
+            f"got status={status}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
 

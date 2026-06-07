@@ -2840,6 +2840,60 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+_KEEP_RUNNING_RE = re.compile(
+    r"^\s*keep_running\s*:\s*(true|yes|1)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# v6.5.1 — Review task detection for the "review-needs-build-parent" gate.
+# Mirrors the verdict-gate detection in tools/kanban_tools.py so a task
+# classified as a "review task" in one place is classified the same way
+# in the other. The set/regex must stay in sync if either changes.
+_REVIEWER_PROFILES_DB = frozenset({"tony", "tchalla", "vision", "elon"})
+_REVIEW_KEYWORD_RE = re.compile(
+    r"\b(review|verify|audit|inspect|smoke[- ]?test|qa)\b", re.IGNORECASE
+)
+
+
+def _is_review_task(assignee: Optional[str], title: Optional[str], body: Optional[str]) -> bool:
+    """True when the task should be subject to v6.5.1 review-dep enforcement.
+
+    Mirrors tools/kanban_tools._check_reviewer_verdict_gate detection:
+    a task is "a review task" iff its assignee is a reviewer profile AND
+    its title or body mentions a review keyword.
+    """
+    if not assignee or assignee.lower() not in _REVIEWER_PROFILES_DB:
+        return False
+    haystack = ((title or "") + " " + (body or "")).strip()
+    return bool(_REVIEW_KEYWORD_RE.search(haystack))
+
+
+def _task_is_keep_running_umbrella(conn: sqlite3.Connection, task_id: str) -> bool:
+    """v6.4: a task with ``keep_running: true`` in its body is an
+    orchestration umbrella, not a worker task.
+
+    The dispatcher treats it specially: children promote regardless of
+    the umbrella's status (Fix A), and protocol_violation crashes do NOT
+    auto-block it (Fix B). Together this makes ``keep_running: true``
+    a state the dispatcher recognizes rather than a rule the agent must
+    obey via poll-loop.
+
+    Surfaced 2026-06-07 in v6.3 first-test: JARVIS gamed the v6.3
+    completion gate by calling kanban_block, which v6.3.1 then sealed.
+    With both terminations rejected, JARVIS exited cleanly and the
+    dispatcher's protocol_violation handler auto-blocked the umbrella
+    — defeating the gate via a different code path. v6.4 closes the
+    loop by making the dispatcher aware of orchestration umbrellas.
+    """
+    row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    body = row["body"] if "body" in row.keys() else None
+    return bool(body and _KEEP_RUNNING_RE.search(body))
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -2927,12 +2981,24 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status, t.body FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # v6.4 Fix A — children of a keep_running umbrella promote on
+            # their *other* parents' status, ignoring the umbrella entirely.
+            # An orchestration umbrella is conceptually never done; it
+            # exists to receive chain events. Forcing its status to gate
+            # child promotion was the v6.3 chain-stall bug.
+            def _parent_eligible(p) -> bool:
+                if p["status"] in ("done", "archived"):
+                    return True
+                body = p["body"] if "body" in p.keys() else None
+                if body and _KEEP_RUNNING_RE.search(body):
+                    return True
+                return False
+            if all(_parent_eligible(p) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -2993,13 +3059,25 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        #
+        # v6.4 Fix A — parents with `keep_running: true` in their body are
+        # orchestration umbrellas, not chain deps. They don't gate child
+        # promotion. recompute_ready already enforces this; the claim path
+        # must agree so a child promoted under v6.4 semantics isn't demoted
+        # back to `todo` here.
+        undone_rows = conn.execute(
+            "SELECT p.id, p.status, p.body FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')",
             (task_id,),
-        ).fetchone()
-        if undone:
+        ).fetchall()
+        truly_undone = False
+        for r in undone_rows:
+            body = r["body"] if "body" in r.keys() else None
+            if not (body and _KEEP_RUNNING_RE.search(body)):
+                truly_undone = True
+                break
+        if truly_undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -3010,6 +3088,77 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # v6.5.1 — Review tasks must have at least one non-review parent.
+        # Surfaced in v6.5 first-test: Pepper created reviewer tasks
+        # (Tony/Tchalla/Vision Block X review) with empty parents. The
+        # tasks promoted immediately, ran against an empty (or stale)
+        # workspace, and Vision used verdict: approve with fabricated
+        # evidence ("13/13 tests pass" when no tests existed). The
+        # verdict gate in kanban_tools forces a verdict PREFIX but
+        # doesn't validate the verdict reflects reality. The structural
+        # fix is to refuse promotion until the review has something
+        # buildy to review against.
+        self_row = conn.execute(
+            "SELECT assignee, title, body FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if self_row and _is_review_task(
+            self_row["assignee"],
+            self_row["title"] if "title" in self_row.keys() else None,
+            self_row["body"] if "body" in self_row.keys() else None,
+        ):
+            parent_rows = conn.execute(
+                "SELECT p.id, p.assignee, p.title, p.body FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            has_non_review_parent = any(
+                not _is_review_task(
+                    p["assignee"],
+                    p["title"] if "title" in p.keys() else None,
+                    p["body"] if "body" in p.keys() else None,
+                )
+                for p in parent_rows
+            )
+            # Also skip the umbrella check: an umbrella is technically a
+            # non-review parent, but it doesn't represent buildable
+            # output. Require at least one non-umbrella non-review parent.
+            has_non_umbrella_non_review_parent = any(
+                not _is_review_task(
+                    p["assignee"],
+                    p["title"] if "title" in p.keys() else None,
+                    p["body"] if "body" in p.keys() else None,
+                )
+                and not (
+                    p["body"] and _KEEP_RUNNING_RE.search(p["body"])
+                )
+                for p in parent_rows
+            )
+            if not has_non_umbrella_non_review_parent:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "last_failure_error = ? "
+                    "WHERE id = ? AND status = 'ready'",
+                    (
+                        "v6.5.1 gate: review task has no non-review, "
+                        "non-umbrella parent — the corresponding build "
+                        "task must be linked via --depends-on so this "
+                        "review runs against actual deliverables instead "
+                        "of an empty workspace. See kanban-orchestration "
+                        "skill § Pepper Chain Integrity.",
+                        task_id,
+                    ),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {
+                        "reason": "review_missing_build_parent",
+                        "parent_count": len(parent_rows),
+                        "non_review_parent": has_non_review_parent,
+                    },
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -5546,6 +5695,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 not protocol_violation
                 and _fp_counts.get(fp, 0) >= 3
             )
+            # v6.4 Fix B (expanded after 2026-06-07 01:00 finding) —
+            # ANY crash on a keep_running umbrella, not just protocol
+            # violations, is allowed to retry without tripping the
+            # breaker. The umbrella's role is orchestration; crashes
+            # on respawn are transient and the dispatcher should keep
+            # bringing it back. Without this expansion the v6.4 chain
+            # stalls when JARVIS's worker hits an unrelated transient
+            # (MCP timeout, gateway glitch) on an orchestration spawn —
+            # the breaker trips at limit=2 and the umbrella is blocked,
+            # defeating the keep_running semantics through a different
+            # crash type than v6.3's protocol_violation route.
+            #
+            # Pathological repeated crashes still leave a paper trail
+            # via the crashed event we already emitted; an operator can
+            # still inspect and act, but the chain doesn't stall on the
+            # umbrella's behalf.
+            if _task_is_keep_running_umbrella(conn, tid):
+                # Already in `ready` and the crash event was already
+                # appended above. Nothing more to do — the umbrella
+                # is in "watching idle" and the dispatcher will re-spawn
+                # JARVIS when there's actually something to orchestrate.
+                continue
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -6559,20 +6730,48 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
     omitting the flag only drops the supplementary pattern library.
     """
+    return _skill_available(hermes_home, "kanban-worker")
+
+
+def _skill_available(hermes_home: Optional[str], skill_name: str) -> bool:
+    """Generalised resolvability check used to filter ``task.skills`` before
+    spawning a worker.
+
+    Surfaced 2026-06-07 in v6.4 first-test: Pepper had ``--skill
+    kanban-orchestration`` baked into her own task by JARVIS at chain spawn,
+    and she passed the same to the build/review children she created.
+    ``kanban-orchestration`` only exists in jarvis's profile-scoped skills
+    dir; spawning a Shuri/Vision worker with ``--skills kanban-orchestration``
+    raised ``ValueError: Unknown skill(s): kanban-orchestration`` and killed
+    the worker at startup. The dispatcher recorded ``crashed exit_code=1``
+    twice and gave up — chain stalled.
+
+    The defensive fix: filter ``task.skills`` through this helper at spawn
+    time. Any skill that does not resolve for the worker's HERMES_HOME is
+    dropped with a logged warning. The agent author's mistake doesn't kill
+    the chain; the operator sees the warning and can fix the spec.
+
+    Mirrors the canonical / bounded-scan strategy from
+    ``_kanban_worker_skill_available`` so the two stay aligned.
+    """
     from pathlib import Path as _Path
 
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
     skills_root = base / "skills"
     if not skills_root.is_dir():
         return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
+    # Canonical layouts first (cheap), then bounded recursion.
+    candidates = (
+        skills_root / skill_name / "SKILL.md",
+        skills_root / "devops" / skill_name / "SKILL.md",
+        skills_root / "qa" / skill_name / "SKILL.md",
+        skills_root / "ui-ux" / skill_name / "SKILL.md",
+    )
+    for c in candidates:
+        if c.is_file():
+            return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
+        for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
             if skill_md.is_file():
                 return True
     except OSError:
@@ -6738,9 +6937,28 @@ def _default_spawn(
     # Dedupe against the built-in so we don't double-load kanban-worker
     # if a task author asks for it explicitly.
     if task.skills:
+        worker_home = env.get("HERMES_HOME")
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
+            if not sk or sk == "kanban-worker":
+                continue
+            # v6.5 defensive filter — if the requested skill doesn't resolve
+            # for this worker's profile, drop it with a warning instead of
+            # crashing the spawn. Preloading an unknown skill is fatal at
+            # CLI startup (ValueError: Unknown skill(s): X). Surfaced
+            # 2026-06-07 when Pepper/Shuri/Vision tasks had
+            # ``skills=["kanban-orchestration"]`` baked in — that skill
+            # only exists for jarvis. Two workers crashed and the chain
+            # stalled before the cause was found in the per-task log.
+            if _skill_available(worker_home, sk):
                 cmd.extend(["--skills", sk])
+            else:
+                logging.getLogger(__name__).warning(
+                    "kanban spawn: task %s requests --skills %s but the "
+                    "skill is not resolvable for profile %s (HERMES_HOME=%s). "
+                    "Dropping the flag to avoid startup crash; review the "
+                    "task body or the spec writer's skill list.",
+                    task.id, sk, profile_arg, worker_home,
+                )
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([

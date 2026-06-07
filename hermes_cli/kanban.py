@@ -309,6 +309,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument("--depends-on", dest="parent", action="append",
+                          help="Dependency task id — strict alias for --parent. "
+                               "Prefer this for chain ordering; --parent is the "
+                               "older synonym retained for umbrella-only links.")
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -1892,8 +1896,30 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
     failed: list[str] = []
+    # v6.3 completion gates — same checks as the kanban_complete TOOL.
+    # The CLI is mostly used by humans (kaipo) and by JARVIS via subprocess,
+    # so we enforce the same way to keep behavior consistent across surfaces.
+    from tools.kanban_tools import (
+        _check_reviewer_verdict_gate,
+        _check_evidence_paths_gate,
+        _check_keep_running_gate,
+    )
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+            gate_err: Optional[str] = None
+            for gate in (
+                _check_reviewer_verdict_gate(task, args.result),
+                _check_evidence_paths_gate(task),
+                _check_keep_running_gate(kb, conn, task),
+            ):
+                if gate:
+                    gate_err = gate
+                    break
+            if gate_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {gate_err}", file=sys.stderr)
+                continue
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
@@ -1941,8 +1967,17 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
+    # v6.3.1 hotfix — keep_running gate now fires on block as well as
+    # complete. See _handle_block for the rationale.
+    from tools.kanban_tools import _check_keep_running_gate
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+            keep_running_err = _check_keep_running_gate(kb, conn, task)
+            if keep_running_err:
+                failed.append(tid)
+                print(f"cannot block {tid}: {keep_running_err}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
