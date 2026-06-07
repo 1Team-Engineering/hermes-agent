@@ -1967,8 +1967,17 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
+    # v6.3.1 hotfix — keep_running gate now fires on block as well as
+    # complete. See _handle_block for the rationale.
+    from tools.kanban_tools import _check_keep_running_gate
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+            keep_running_err = _check_keep_running_gate(kb, conn, task)
+            if keep_running_err:
+                failed.append(tid)
+                print(f"cannot block {tid}: {keep_running_err}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(

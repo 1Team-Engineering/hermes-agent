@@ -838,6 +838,22 @@ def _handle_block(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # v6.3.1 hotfix — the keep_running gate now fires on BLOCK
+            # as well as COMPLETE. In v6.3 first-test (2026-06-06) JARVIS
+            # routed around the completion gate by calling kanban_block
+            # on the umbrella instead of kanban_complete. The block
+            # transitioned to "blocked", which the dispatcher treats as
+            # non-promotable for children, so the chain stalled with
+            # Banner stuck in `todo` for 30+ minutes. The other two gates
+            # (verdict, evidence-path) stay completion-only — a reviewer
+            # blocking on infra and a builder blocking honestly on
+            # missing artifacts are both legitimate uses of kanban_block.
+            task = kb.get_task(conn, tid)
+            keep_running_err = _check_keep_running_gate(kb, conn, task)
+            if keep_running_err:
+                # Reuse the gate's prose; the agent's next move is to
+                # advance descendants to terminal, not to retry block.
+                return tool_error(keep_running_err)
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,

@@ -659,6 +659,63 @@ def test_keep_running_gate_bypasses_when_no_marker(monkeypatch, tmp_path):
     assert json.loads(out).get("ok") is True
 
 
+def test_keep_running_gate_fires_on_block_too(monkeypatch, tmp_path):
+    """v6.3.1 hotfix — kanban_block on a keep_running umbrella with a live
+    child must be rejected (same way as kanban_complete).
+
+    Surfaced 2026-06-07 when JARVIS routed around the v6.3 keep_running
+    completion gate by calling kanban_block on the umbrella with reason
+    'awaiting-async-event'. The umbrella transitioned to `blocked`, the
+    dispatcher refused to promote children of a blocked parent, and the
+    chain stalled. Block must enforce the same descendants-terminal rule
+    that complete enforces.
+
+    The verdict and evidence-path gates stay completion-only — a reviewer
+    blocking on infra and a builder blocking honestly on missing artifacts
+    are both legitimate uses of kanban_block.
+    """
+    body = "keep_running: true\n"
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="v6.3.1 umbrella",
+        body=body,
+    )
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.create_task(conn, title="live child", assignee="friday")
+        kb.link_tasks(conn, parent_tid, child)
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "awaiting-async-event"})
+    d = json.loads(out)
+    assert "error" in d, f"expected block to be rejected; got: {d}"
+    assert "keep_running" in d["error"] or "descendant" in d["error"]
+    assert parent_tid in d["error"]
+
+
+def test_block_passes_on_non_umbrella(monkeypatch, tmp_path):
+    """Non-umbrella tasks (no keep_running marker) can block normally —
+    e.g. Friday blocking honestly because he can't produce an artifact."""
+    _make_task(
+        monkeypatch, tmp_path,
+        assignee="friday",
+        title="friday Block A",
+        body=(
+            "Build the routes.\n\n"
+            "required_evidence_paths:\n"
+            "  - /tmp/v6-3-1-evidence-not-yet.log\n"
+        ),
+    )
+    from tools import kanban_tools as kt
+    out = kt._handle_block({
+        "reason": "evidence: /tmp/v6-3-1-evidence-not-yet.log could not be produced because dev server crashed",
+    })
+    assert json.loads(out).get("ok") is True
+
+
 def test_depends_on_alias_appears_in_create_help():
     """--depends-on is exposed alongside --parent on `hermes kanban create`.
 
