@@ -31,11 +31,224 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# v6.3 completion gates — enforce discipline at the CLI/tool layer
+# ---------------------------------------------------------------------------
+#
+# Three test cycles (v6, v6.1, v6.2 on 2026-06-06) demonstrated that
+# discipline rules living in SOUL/skill text don't reliably bind for
+# existing agents under load. Fresh agents bind the rules on first use;
+# existing agents read the updated text and revert to baseline behavior.
+#
+# v6.3 ships dispatcher-level enforcement: the agent gets a tool_error
+# (which the model interprets as a retryable failure, like the existing
+# HallucinatedCardsError pattern) rather than a green checkmark. Three
+# gates fire on every kanban_complete:
+#
+#   1. Reviewer verdict gate — review tasks must end with a verdict
+#   2. Evidence-path gate    — declared artifacts must exist on disk
+#   3. Keep-running umbrella — umbrella tasks can't complete with live children
+#
+# Each gate runs BEFORE kb.complete_task is called. Task state is not
+# mutated when a gate rejects (mirrors HallucinatedCardsError semantics).
+
+_REVIEWER_PROFILES = frozenset({"tony", "tchalla", "vision", "elon"})
+
+# A review task signals "review-ness" via title/body keywords. We cast a wide
+# net here because the cost of asking a non-review task for a verdict is low
+# (the agent passes verdict: not-applicable or pivots to a non-review verb).
+_REVIEW_KEYWORD_RE = re.compile(
+    r"\b(review|verify|audit|inspect|smoke[- ]?test|qa)\b", re.IGNORECASE
+)
+_VERDICT_PREFIX_RE = re.compile(
+    r"^\s*verdict\s*:\s*(approve|reject|not[- ]?applicable)\b",
+    re.IGNORECASE,
+)
+
+_PATH_LIST_RE = re.compile(r"^\s*-\s+(.+?)\s*$")
+_YAML_KEY_RE = re.compile(r"^[A-Za-z][\w-]*:")
+
+# Body markers — YAML-shaped, parser-tolerant. Same convention as the
+# enforce_evidence_paths.py companion script in hermes-jarvis.
+_REQUIRED_EVIDENCE_KEY = "required_evidence_paths:"
+_KEEP_RUNNING_KEY = "keep_running:"
+
+
+def _extract_yaml_list(body: str, key: str) -> list[str]:
+    """Parse a YAML-shaped list under ``key`` from ``body``.
+
+    Tolerant of:
+      * inline form ``key: [a, b]``
+      * block form with ``-`` list items at any indent
+      * surrounding prose; stops at the next top-level YAML key
+
+    Returns the (possibly empty) list of raw values.
+    """
+    if not body:
+        return []
+    out: list[str] = []
+    in_block = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not in_block:
+            if stripped.lower().startswith(key.lower()):
+                in_block = True
+                inline = stripped[len(key):].strip()
+                if inline.startswith("[") and inline.endswith("]"):
+                    for raw in inline[1:-1].split(","):
+                        item = raw.strip().strip("'\"")
+                        if item:
+                            out.append(item)
+                    return out
+            continue
+        if not line.strip():
+            continue
+        if not line.startswith(" ") and _YAML_KEY_RE.match(line):
+            break
+        m = _PATH_LIST_RE.match(line)
+        if m:
+            out.append(m.group(1).strip().strip("'\""))
+        elif not line.startswith(" "):
+            break
+    return out
+
+
+def _extract_yaml_scalar(body: str, key: str) -> Optional[str]:
+    """Parse a YAML-shaped scalar under ``key`` from ``body``.
+
+    Returns the trimmed value, or None if the key is absent.
+    """
+    if not body:
+        return None
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith(key.lower()):
+            return stripped[len(key):].strip().strip("'\"")
+    return None
+
+
+def _check_reviewer_verdict_gate(task, result: Optional[str]) -> Optional[str]:
+    """If the task is a review task, require a verdict in ``result``.
+
+    Returns None on pass; an error sentence on reject.
+    """
+    if not task:
+        return None
+    assignee = (task.assignee or "").lower()
+    if assignee not in _REVIEWER_PROFILES:
+        return None
+    title_body = ((task.title or "") + " " + (task.body or "")).strip()
+    if not _REVIEW_KEYWORD_RE.search(title_body):
+        return None
+    if result and _VERDICT_PREFIX_RE.match(result):
+        return None
+    return (
+        f"kanban_complete blocked: task {task.id} is a review task "
+        f"(assignee={assignee}) and requires a verdict. "
+        f"Pass `result=\"verdict: approve\"` or "
+        f"`result=\"verdict: reject\"` (with reasons in metadata). "
+        f"Your task is still in-flight (no state change) — retry "
+        f"kanban_complete with the verdict prefix on result. "
+        f"See kanban-worker SKILL.md § Reviewer Verdict Convention."
+    )
+
+
+def _check_evidence_paths_gate(task) -> Optional[str]:
+    """If the task body declares ``required_evidence_paths:``, verify them.
+
+    Returns None on pass; an error sentence listing failed paths on reject.
+    """
+    if not task or not task.body:
+        return None
+    declared = _extract_yaml_list(task.body, _REQUIRED_EVIDENCE_KEY)
+    if not declared:
+        return None
+    workspace = task.workspace_path or os.environ.get("HERMES_KANBAN_WORKSPACE")
+    failures: list[str] = []
+    for raw in declared:
+        p = Path(os.path.expanduser(raw))
+        if not p.is_absolute():
+            base = Path(workspace) if workspace else Path.home()
+            p = base / p
+        if not p.exists():
+            failures.append(f"{raw} (missing)")
+            continue
+        try:
+            if p.is_dir():
+                if not any(p.iterdir()):
+                    failures.append(f"{raw} (empty directory)")
+            elif p.stat().st_size == 0:
+                failures.append(f"{raw} (empty file)")
+        except OSError as e:
+            failures.append(f"{raw} (stat failed: {e})")
+    if not failures:
+        return None
+    return (
+        f"kanban_complete blocked: task {task.id} declares "
+        f"required_evidence_paths but {len(failures)} of "
+        f"{len(declared)} are missing or empty: "
+        f"{', '.join(failures[:5])}"
+        f"{' ...' if len(failures) > 5 else ''}. "
+        f"Your task is still in-flight (no state change) — produce "
+        f"the artifact(s) listed in the task body, OR kanban_block "
+        f"with `reason: 'evidence: <path> could not be produced because "
+        f"<reason>'` if production failed."
+    )
+
+
+def _check_keep_running_gate(kb, conn, task) -> Optional[str]:
+    """If the task body declares ``keep_running: true``, refuse completion
+    while any descendant is non-terminal.
+
+    Used for orchestration umbrellas (JARVIS-watcher pattern). Returns None
+    on pass; an error sentence listing live descendants on reject.
+    """
+    if not task or not task.body:
+        return None
+    scalar = _extract_yaml_scalar(task.body, _KEEP_RUNNING_KEY)
+    if not scalar or scalar.lower() not in ("true", "yes", "1"):
+        return None
+    # Walk descendants via the children relationship.
+    terminal_states = {"done", "archived", "cancelled"}
+    visited: set[str] = set()
+    live: list[tuple[str, str, str]] = []  # (id, status, assignee)
+    queue = [task.id]
+    while queue and len(live) < 10:
+        node_id = queue.pop(0)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        rows = conn.execute(
+            "SELECT id, status, assignee FROM tasks "
+            "WHERE id IN (SELECT child_id FROM task_links WHERE parent_id = ?)",
+            (node_id,),
+        ).fetchall()
+        for row in rows:
+            cid, status, assignee = row[0], row[1], row[2]
+            if status not in terminal_states:
+                live.append((cid, status or "?", assignee or "?"))
+            queue.append(cid)
+    if not live:
+        return None
+    summary = ", ".join(f"{cid} ({assignee}: {status})" for cid, status, assignee in live[:5])
+    return (
+        f"kanban_complete blocked: task {task.id} is a keep_running "
+        f"umbrella and {len(live)} descendant(s) are still non-terminal: "
+        f"{summary}{' ...' if len(live) > 5 else ''}. "
+        f"Your task is still in-flight (no state change) — orchestrate "
+        f"the remaining children to terminal (done/archived/cancelled) "
+        f"before completing the umbrella. See kanban-orchestration "
+        f"SKILL.md § JARVIS as Standing Watcher."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +766,19 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # v6.3 completion gates — run BEFORE kb.complete_task so the
+            # task is not mutated when a gate rejects. The agent retries
+            # by addressing the gate (produce the artifact, supply the
+            # verdict, finish the children) and calling kanban_complete
+            # again with the same summary/metadata.
+            task = kb.get_task(conn, tid)
+            for gate in (
+                _check_reviewer_verdict_gate(task, result),
+                _check_evidence_paths_gate(task),
+                _check_keep_running_gate(kb, conn, task),
+            ):
+                if gate:
+                    return tool_error(gate)
             try:
                 ok = kb.complete_task(
                     conn, tid,
