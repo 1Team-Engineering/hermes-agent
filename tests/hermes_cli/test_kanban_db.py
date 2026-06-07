@@ -579,6 +579,56 @@ def test_protocol_violation_on_keep_running_umbrella_does_not_auto_block(
         )
 
 
+def test_real_crash_on_keep_running_umbrella_does_not_auto_block(
+    kanban_home, monkeypatch,
+):
+    """v6.4 Fix B (expanded) — ANY crash on a keep_running umbrella,
+    not just protocol violations, leaves the breaker untripped.
+
+    Surfaced 2026-06-07 01:00 in the v6.4 first-test: JARVIS's
+    orchestration worker hit a real crash (not clean exit) on the
+    second tick. The original Fix B only covered clean_exit;
+    real-crash routes through the normal failure handler and tripped
+    the breaker at limit=2, blocking the umbrella anyway.
+
+    Pathological repeated crashes still leave a paper trail; the
+    operator can still inspect via the crashed event sequence. But
+    the chain doesn't stall on the umbrella's behalf.
+    """
+    fake_pid = 999_997
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="v6.4 umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        kb.claim_task(conn, umbrella)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (fake_pid, 0, umbrella),
+        )
+        conn.commit()
+    # Simulate a real crash (nonzero exit), not a clean exit.
+    from hermes_cli import kanban_db as _kb
+    real_classify = _kb._classify_worker_exit
+    real_alive = _kb._pid_alive
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit",
+        lambda p: ("nonzero_exit", 1) if int(p) == fake_pid else real_classify(p),
+    )
+    monkeypatch.setattr(
+        _kb, "_pid_alive",
+        lambda p: False if int(p or 0) == fake_pid else real_alive(p),
+    )
+    with kb.connect() as conn:
+        crashed = kb.detect_crashed_workers(conn)
+        assert umbrella in crashed
+        status = kb.get_task(conn, umbrella).status
+        assert status == "ready", (
+            f"keep_running umbrella should stay ready after ANY crash; "
+            f"got status={status}"
+        )
+
+
 def test_protocol_violation_on_regular_task_still_auto_blocks(
     kanban_home, monkeypatch,
 ):

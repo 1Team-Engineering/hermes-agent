@@ -5602,17 +5602,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 not protocol_violation
                 and _fp_counts.get(fp, 0) >= 3
             )
-            # v6.4 Fix B — protocol_violation on a keep_running umbrella is
-            # not a failure. The umbrella's job is to receive chain events,
-            # not to do worker work. JARVIS exiting cleanly when no chain
-            # event needs orchestration is the correct behavior. Skip the
-            # failure recording so the breaker doesn't trip; the umbrella
-            # stays in `ready` (already set by detect_crashed_workers
-            # earlier) and will be re-claimed on the next dispatch tick
-            # when an event lands.
-            if protocol_violation and _task_is_keep_running_umbrella(conn, tid):
-                # Already in `ready` and the protocol_violation event was
-                # already appended above. Nothing more to do — the umbrella
+            # v6.4 Fix B (expanded after 2026-06-07 01:00 finding) —
+            # ANY crash on a keep_running umbrella, not just protocol
+            # violations, is allowed to retry without tripping the
+            # breaker. The umbrella's role is orchestration; crashes
+            # on respawn are transient and the dispatcher should keep
+            # bringing it back. Without this expansion the v6.4 chain
+            # stalls when JARVIS's worker hits an unrelated transient
+            # (MCP timeout, gateway glitch) on an orchestration spawn —
+            # the breaker trips at limit=2 and the umbrella is blocked,
+            # defeating the keep_running semantics through a different
+            # crash type than v6.3's protocol_violation route.
+            #
+            # Pathological repeated crashes still leave a paper trail
+            # via the crashed event we already emitted; an operator can
+            # still inspect and act, but the chain doesn't stall on the
+            # umbrella's behalf.
+            if _task_is_keep_running_umbrella(conn, tid):
+                # Already in `ready` and the crash event was already
+                # appended above. Nothing more to do — the umbrella
                 # is in "watching idle" and the dispatcher will re-spawn
                 # JARVIS when there's actually something to orchestrate.
                 continue
