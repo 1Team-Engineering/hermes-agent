@@ -579,6 +579,33 @@ def test_protocol_violation_on_keep_running_umbrella_does_not_auto_block(
         )
 
 
+def test_skill_available_finds_canonical_locations(kanban_home):
+    """v6.5 — _skill_available finds skills in canonical locations
+    (devops/, qa/, ui-ux/) AND via bounded rglob fallback."""
+    from hermes_cli.kanban_db import _skill_available
+    import os, pathlib
+    home = pathlib.Path(os.environ["HERMES_HOME"])
+    skills_root = home / "skills"
+
+    # Build a fake skill in the devops/ canonical layout
+    devops_skill = skills_root / "devops" / "my-skill" / "SKILL.md"
+    devops_skill.parent.mkdir(parents=True, exist_ok=True)
+    devops_skill.write_text("# my-skill")
+    assert _skill_available(str(home), "my-skill")
+
+    # And in a non-canonical nested layout
+    nested_skill = skills_root / "tenants" / "acme" / "deep-skill" / "SKILL.md"
+    nested_skill.parent.mkdir(parents=True, exist_ok=True)
+    nested_skill.write_text("# deep-skill")
+    assert _skill_available(str(home), "deep-skill")
+
+    # Missing skill returns False (this is the spawn-crash mitigation)
+    assert not _skill_available(str(home), "kanban-orchestration"), (
+        "kanban-orchestration should NOT be in this test profile's skills dir; "
+        "the dispatcher must filter it from --skills flags before spawn"
+    )
+
+
 def test_real_crash_on_keep_running_umbrella_does_not_auto_block(
     kanban_home, monkeypatch,
 ):

@@ -6637,20 +6637,48 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
     omitting the flag only drops the supplementary pattern library.
     """
+    return _skill_available(hermes_home, "kanban-worker")
+
+
+def _skill_available(hermes_home: Optional[str], skill_name: str) -> bool:
+    """Generalised resolvability check used to filter ``task.skills`` before
+    spawning a worker.
+
+    Surfaced 2026-06-07 in v6.4 first-test: Pepper had ``--skill
+    kanban-orchestration`` baked into her own task by JARVIS at chain spawn,
+    and she passed the same to the build/review children she created.
+    ``kanban-orchestration`` only exists in jarvis's profile-scoped skills
+    dir; spawning a Shuri/Vision worker with ``--skills kanban-orchestration``
+    raised ``ValueError: Unknown skill(s): kanban-orchestration`` and killed
+    the worker at startup. The dispatcher recorded ``crashed exit_code=1``
+    twice and gave up — chain stalled.
+
+    The defensive fix: filter ``task.skills`` through this helper at spawn
+    time. Any skill that does not resolve for the worker's HERMES_HOME is
+    dropped with a logged warning. The agent author's mistake doesn't kill
+    the chain; the operator sees the warning and can fix the spec.
+
+    Mirrors the canonical / bounded-scan strategy from
+    ``_kanban_worker_skill_available`` so the two stay aligned.
+    """
     from pathlib import Path as _Path
 
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
     skills_root = base / "skills"
     if not skills_root.is_dir():
         return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
+    # Canonical layouts first (cheap), then bounded recursion.
+    candidates = (
+        skills_root / skill_name / "SKILL.md",
+        skills_root / "devops" / skill_name / "SKILL.md",
+        skills_root / "qa" / skill_name / "SKILL.md",
+        skills_root / "ui-ux" / skill_name / "SKILL.md",
+    )
+    for c in candidates:
+        if c.is_file():
+            return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
+        for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
             if skill_md.is_file():
                 return True
     except OSError:
@@ -6816,9 +6844,28 @@ def _default_spawn(
     # Dedupe against the built-in so we don't double-load kanban-worker
     # if a task author asks for it explicitly.
     if task.skills:
+        worker_home = env.get("HERMES_HOME")
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
+            if not sk or sk == "kanban-worker":
+                continue
+            # v6.5 defensive filter — if the requested skill doesn't resolve
+            # for this worker's profile, drop it with a warning instead of
+            # crashing the spawn. Preloading an unknown skill is fatal at
+            # CLI startup (ValueError: Unknown skill(s): X). Surfaced
+            # 2026-06-07 when Pepper/Shuri/Vision tasks had
+            # ``skills=["kanban-orchestration"]`` baked in — that skill
+            # only exists for jarvis. Two workers crashed and the chain
+            # stalled before the cause was found in the per-task log.
+            if _skill_available(worker_home, sk):
                 cmd.extend(["--skills", sk])
+            else:
+                logging.getLogger(__name__).warning(
+                    "kanban spawn: task %s requests --skills %s but the "
+                    "skill is not resolvable for profile %s (HERMES_HOME=%s). "
+                    "Dropping the flag to avoid startup crash; review the "
+                    "task body or the spec writer's skill list.",
+                    task.id, sk, profile_arg, worker_home,
+                )
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([
