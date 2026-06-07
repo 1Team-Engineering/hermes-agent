@@ -390,6 +390,71 @@ def test_recompute_ready_promotes_through_keep_running_umbrella(kanban_home):
             )
 
 
+def test_claim_task_allows_keep_running_umbrella_parent(kanban_home):
+    """v6.4 Fix A extended — claim_task's parents-not-done invariant
+    must also recognize keep_running umbrellas, otherwise a child
+    promoted by recompute_ready gets demoted back to `todo` on the
+    first claim attempt.
+
+    Surfaced 2026-06-07 in v6.4 first-test: Banner kept getting promoted
+    (Fix A worked in recompute_ready) and then claim_rejected with
+    reason: parents_not_done (Fix A missing from claim_task). The
+    invariant cycle prevented Banner from ever running.
+    """
+    with kb.connect() as conn:
+        umbrella = kb.create_task(
+            conn, title="v6.4 umbrella", assignee="jarvis",
+            body="keep_running: true",
+        )
+        banner = kb.create_task(
+            conn, title="banner research", assignee="banner",
+            parents=[umbrella],
+        )
+        # Force umbrella running (a real chain state, not done).
+        conn.execute(
+            "UPDATE tasks SET status='running' WHERE id=?",
+            (umbrella,),
+        )
+        # Force banner ready (post-recompute_ready state).
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (banner,)
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, banner)
+        assert claimed is not None, (
+            "Banner should be claimable when umbrella is keep_running, "
+            "even if umbrella is `running` (not done)"
+        )
+        assert kb.get_task(conn, banner).status == "running"
+
+
+def test_claim_task_still_blocks_undone_regular_parent(kanban_home):
+    """v6.4 Fix A guard rail — claim_task still demotes a child whose
+    regular (non-keep_running) parent is undone."""
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="regular parent", assignee="banner",
+            body="No keep_running here.",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="friday", parents=[parent],
+        )
+        # Force statuses: parent running (not done), child ready.
+        conn.execute(
+            "UPDATE tasks SET status='running' WHERE id=?", (parent,)
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (child,)
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, child)
+        assert claimed is None, (
+            "child should NOT be claimable when regular parent is running"
+        )
+        # And the invariant demoted it back.
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_recompute_ready_does_not_promote_through_regular_parent(kanban_home):
     """v6.4 Fix A guard rail — a child whose parent does NOT have
     keep_running: true must still wait for that parent to complete."""

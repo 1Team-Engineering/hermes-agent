@@ -3037,13 +3037,25 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        #
+        # v6.4 Fix A — parents with `keep_running: true` in their body are
+        # orchestration umbrellas, not chain deps. They don't gate child
+        # promotion. recompute_ready already enforces this; the claim path
+        # must agree so a child promoted under v6.4 semantics isn't demoted
+        # back to `todo` here.
+        undone_rows = conn.execute(
+            "SELECT p.id, p.status, p.body FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')",
             (task_id,),
-        ).fetchone()
-        if undone:
+        ).fetchall()
+        truly_undone = False
+        for r in undone_rows:
+            body = r["body"] if "body" in r.keys() else None
+            if not (body and _KEEP_RUNNING_RE.search(body)):
+                truly_undone = True
+                break
+        if truly_undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
