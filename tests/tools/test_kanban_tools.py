@@ -638,6 +638,47 @@ def test_keep_running_gate_passes_when_all_children_terminal(monkeypatch, tmp_pa
     assert json.loads(out).get("ok") is True
 
 
+def test_keep_running_gate_tenant_walk_finds_unlinked_siblings(monkeypatch, tmp_path):
+    """v6.6 — when the umbrella has a tenant set, the gate walks by
+    tenant instead of task_links. Closes the v6.5.1 stall route where
+    Pepper-shaped chains don't link build tasks back to the umbrella —
+    Shuri/Vision/Friday tasks have parents=[chain-predecessor] not
+    parents=[umbrella, ...]. The umbrella's task_links would only find
+    Banner+Pepper directly. Tenant scoping finds the whole chain.
+    """
+    body = "keep_running: true\n"
+    parent_tid = _make_task(
+        monkeypatch, tmp_path,
+        assignee="jarvis",
+        title="v6.6 umbrella",
+        body=body,
+    )
+    # Tag both the umbrella AND a sibling task with the same tenant,
+    # and DO NOT link them via task_links — simulates Pepper's chain
+    # shape (build tasks have parents pointing at chain predecessors,
+    # not back at the umbrella).
+    tenant = "marvel-swarm-v6-6-tenant-walk-test"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET tenant=? WHERE id=?", (tenant, parent_tid))
+        # Create a sibling in the same tenant, unlinked
+        sibling = kb.create_task(
+            conn, title="orphan build task", assignee="shuri",
+            tenant=tenant,
+        )
+        # No kb.link_tasks call — just same tenant
+        conn.commit()
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "trying to close while tenant has live work"})
+    d = json.loads(out)
+    assert "error" in d, f"expected tenant-scoped gate to reject; got: {d}"
+    assert "tenant" in d["error"].lower()
+    assert parent_tid in d["error"]
+
+
 def test_keep_running_gate_bypasses_when_no_marker(monkeypatch, tmp_path):
     """An umbrella without keep_running: true closes normally even with live
     descendants — opt-in semantics."""

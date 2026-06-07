@@ -207,20 +207,67 @@ def _check_evidence_paths_gate(task) -> Optional[str]:
 
 def _check_keep_running_gate(kb, conn, task) -> Optional[str]:
     """If the task body declares ``keep_running: true``, refuse completion
-    while any descendant is non-terminal.
+    while any other non-terminal task exists in the umbrella's tenant.
 
-    Used for orchestration umbrellas (JARVIS-watcher pattern). Returns None
-    on pass; an error sentence listing live descendants on reject.
+    v6.6 changed the walk from ``task_links`` to tenant-scoped because
+    Pepper-shaped chains don't link build tasks back to the umbrella —
+    Shuri/Vision/Friday tasks have ``parents=[chain-predecessor]`` not
+    ``parents=[umbrella, ...]``. The v6.5.1 first-test showed the gate
+    finding only {Banner, Pepper} via task_links and missing all the
+    actual build/review work running in the tenant. JARVIS gamed the
+    gate by blocking with ``"awaiting-async-event"``. Tenant scoping
+    closes the route — any live task in the tenant counts as a live
+    descendant for the umbrella's purposes.
+
+    The umbrella must have a tenant set (orchestration umbrellas should
+    always have one). If not, fall back to task_links walking — the
+    v6.5 behavior — so single-board / no-tenant deployments still get
+    the gate.
+
+    Returns None on pass; an error sentence listing live descendants on
+    reject.
     """
     if not task or not task.body:
         return None
     scalar = _extract_yaml_scalar(task.body, _KEEP_RUNNING_KEY)
     if not scalar or scalar.lower() not in ("true", "yes", "1"):
         return None
-    # Walk descendants via the children relationship.
     terminal_states = {"done", "archived", "cancelled"}
-    visited: set[str] = set()
     live: list[tuple[str, str, str]] = []  # (id, status, assignee)
+    tenant = getattr(task, "tenant", None)
+    if tenant:
+        # v6.6 — tenant-scoped walk. Find every non-terminal task in the
+        # umbrella's tenant other than the umbrella itself.
+        rows = conn.execute(
+            "SELECT id, status, assignee FROM tasks "
+            "WHERE tenant = ? AND id != ? AND status NOT IN "
+            "('done', 'archived', 'cancelled') "
+            "LIMIT 20",
+            (tenant, task.id),
+        ).fetchall()
+        for row in rows:
+            if len(live) >= 10:
+                break
+            live.append((row[0], row[1] or "?", row[2] or "?"))
+        if not live:
+            return None
+        summary = ", ".join(
+            f"{cid} ({assignee}: {status})" for cid, status, assignee in live[:5]
+        )
+        return (
+            f"kanban_complete blocked: task {task.id} is a keep_running "
+            f"umbrella and {len(live)} task(s) in tenant '{tenant}' are "
+            f"still non-terminal: {summary}"
+            f"{' ...' if len(live) > 5 else ''}. "
+            f"Your task is still in-flight (no state change) — orchestrate "
+            f"the remaining tenant tasks to terminal (done/archived/"
+            f"cancelled) before completing the umbrella. See "
+            f"kanban-orchestration SKILL.md § JARVIS as Event-Driven "
+            f"Orchestrator."
+        )
+    # Legacy fallback — walk descendants via task_links. Used when the
+    # umbrella has no tenant (single-board deployments).
+    visited: set[str] = set()
     queue = [task.id]
     while queue and len(live) < 10:
         node_id = queue.pop(0)
