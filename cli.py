@@ -3109,6 +3109,13 @@ class HermesCLI:
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        # Stash for the most recent chat() turn's run_conversation result.
+        # Single-query callers in main() inspect this AFTER chat() returns to
+        # decide the worker exit code (e.g. rate-limit → exit 75 per
+        # `_worker_exit_code_from_result`). Initialized here so the
+        # invariant "stash is reset at turn boundary" doesn't depend on
+        # any early returns inside chat().
+        self._last_run_result = None
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -12350,6 +12357,12 @@ class HermesCLI:
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         print(flush=True)
         
+        # Reset stash at turn boundary so a downstream consumer (e.g. the
+        # non-quiet `chat -q "..."` exit-code mapper) never reads a stale
+        # failure dict from a previous turn. Set explicitly here so the
+        # invariant doesn't depend on the order of early returns below.
+        self._last_run_result = None
+
         try:
             # Run the conversation with interrupt monitoring
             result = None
@@ -12827,10 +12840,26 @@ class HermesCLI:
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            # Stash the run result so single-query callers can inspect
+            # failure_reason (rate_limit/billing) for kanban-worker exit code
+            # mapping. See `_worker_exit_code_from_result` and hermes-agent#5.
+            # chat() itself returns only the response string for back-compat;
+            # this attribute is the only out-of-band channel for run metadata.
+            self._last_run_result = result
+
             return response
             
         except Exception as e:
             print(f"Error: {e}")
+            # Synthesize a failure result so single-query callers downstream
+            # can still apply the kanban exit-code mapping (a thrown exception
+            # is by definition a failure — `failure_reason` is unknown so the
+            # rate-limit special case won't fire, and we fall through to exit 1).
+            self._last_run_result = {
+                "failed": True,
+                "error": str(e)[:300],
+                "completed": False,
+            }
             return None
         finally:
             # Ensure streaming TTS resources are cleaned up even on error.
@@ -15697,6 +15726,39 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _worker_exit_code_from_result(result) -> int:
+    """Map a run_conversation/chat result dict to a process exit code.
+
+    Contract:
+      - Success or no result info → 0
+      - Failure outside a kanban worker → 1
+      - Failure inside a kanban worker (HERMES_KANBAN_TASK env set) WITH
+        failure_reason ∈ {rate_limit, billing} → KANBAN_RATE_LIMIT_EXIT_CODE (75)
+      - Any other failure inside a kanban worker → 1
+
+    Closes hermes-agent#5: the non-quiet `chat -q "..."` path (the one
+    Marvel team workers actually use) previously didn't apply this mapping
+    at all — a rate-limited worker exited 0 by virtue of `cli.chat()`
+    returning cleanly. The dispatcher then classified the 0-exit as a
+    "protocol violation" and auto-blocked the task. This helper is now
+    called from BOTH the quiet (-Q / --quiet) and non-quiet (--q "...")
+    single-query paths so the exit-code contract is consistent.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+    if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+        "failure_reason"
+    ) in ("rate_limit", "billing"):
+        try:
+            from hermes_cli.kanban_db import (
+                KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+            )
+            return _RL_CODE
+        except Exception:
+            return 1
+    return 1
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -16118,31 +16180,9 @@ def main(
                     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
                     # Ensure proper exit code for automation wrappers.
-                    #
-                    # Kanban workers get a special case: when the run failed
-                    # purely because the provider rate-limited / exhausted
-                    # quota (not because the task itself is broken), exit with
-                    # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                    # dispatcher's reap classifier maps that code to a
-                    # ``rate_limited`` exit and releases the task back to
-                    # ``ready`` WITHOUT incrementing the failure counter, so a
-                    # 5-hour quota window can't trip the circuit breaker and
-                    # permanently block the card. Non-kanban runs keep the
-                    # plain 0/1 contract automation wrappers expect.
-                    _exit_code = 0
-                    if isinstance(result, dict) and result.get("failed"):
-                        _exit_code = 1
-                        if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                            "failure_reason"
-                        ) in ("rate_limit", "billing"):
-                            try:
-                                from hermes_cli.kanban_db import (
-                                    KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                )
-                                _exit_code = _RL_CODE
-                            except Exception:
-                                _exit_code = 1
-                    sys.exit(_exit_code)
+                    # See `_worker_exit_code_from_result` for the kanban
+                    # EX_TEMPFAIL special case (rate-limit → exit 75).
+                    sys.exit(_worker_exit_code_from_result(result))
             
             # Exit with error code if credentials or agent init fails
             sys.exit(1)
@@ -16168,6 +16208,16 @@ def main(
             cli._show_security_advisories()
             cli.chat(query, images=single_query_images or None)
             cli._print_exit_summary()
+            # Apply the same kanban-worker exit-code mapping that the quiet
+            # path uses, so a rate-limited run gets EX_TEMPFAIL (75) instead
+            # of the implicit 0 that defaults from a clean function return.
+            # Without this, Codex 429 in a worker exits 0 → dispatcher
+            # classifies as "protocol violation" → auto-blocks the task.
+            # (hermes-agent#5 root cause.)
+            _last_result = getattr(cli, "_last_run_result", None)
+            _exit_code = _worker_exit_code_from_result(_last_result)
+            if _exit_code != 0:
+                sys.exit(_exit_code)
         return
     
     # Run interactive mode
