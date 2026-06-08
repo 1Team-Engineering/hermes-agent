@@ -27,7 +27,129 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Optional
 
+from hermes_cli.auth import AuthError
 from hermes_cli.fallback_config import get_fallback_chain
+
+
+def _resolve_runtime_with_fallback(
+    *,
+    resolve_runtime_provider,
+    effective_provider: Optional[str],
+    effective_model: str,
+    explicit_base_url: Optional[str],
+    fallback_chain: list,
+    logger: logging.Logger,
+    explicit_pin: bool = False,
+) -> tuple[dict, str, int, list]:
+    """Resolve runtime credentials with fallback-chain tolerance.
+
+    Tries the primary provider first. On AuthError, iterates the configured
+    fallback chain (typically Claude → Codex → Grok 4.3 per team policy) until
+    one succeeds. Raises the LAST AuthError if every fallback also fails.
+
+    This closes hermes-agent#6: a single provider's auth failure (e.g. xAI OAuth
+    token expired) used to crash worker startup before AIAgent's runtime
+    fallback loop could ever try the next provider. The fallback chain was
+    configured precisely for this case but was only honored AFTER successful
+    credential resolution, not during it.
+
+    Special cases:
+        * ``explicit_pin=True`` — the caller pinned model AND/OR provider on
+          the CLI (e.g. ``hermes -z --model grok-4.3 --provider xai-oauth``).
+          Silent downgrade would surprise them, so we re-raise the primary
+          AuthError verbatim with no fallback attempt.
+        * Rate-limit AuthError on the primary — falling through wastes the
+          quota of every other configured provider in ~milliseconds (the
+          "quota amplification" footgun). Re-raise primary error verbatim;
+          existing rate-limit handling (cli.py exit code 75) takes over.
+
+    Returns:
+        (runtime_dict, effective_model, landed_at_index, remaining_chain)
+
+        ``landed_at_index`` is -1 if primary succeeded, else the 0-based
+        index into the original ``fallback_chain`` that resolved. Callers
+        should pass ``remaining_chain`` (the entries AFTER the landed-on
+        one) to AIAgent's ``fallback_model`` to avoid AIAgent re-attempting
+        the already-dead primary or the entry we just used.
+    """
+    # Lazy-import to avoid a hard dependency at module load time (the rate-limit
+    # detector lives in hermes_cli.auth alongside AuthError).
+    try:
+        from hermes_cli.auth import is_rate_limited_auth_error
+    except ImportError:  # pragma: no cover - defensive only
+        is_rate_limited_auth_error = lambda _exc: False  # noqa: E731
+
+    try:
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+            explicit_base_url=explicit_base_url,
+        )
+        return runtime, effective_model, -1, list(fallback_chain)
+    except AuthError as primary_exc:
+        if explicit_pin:
+            # User explicitly pinned model/provider on the CLI — they would
+            # rather see the failure than get silently downgraded to another
+            # provider. Preserve that contract.
+            logger.warning(
+                "primary provider %r auth failed and caller pinned model/provider; "
+                "not attempting fallback (use auto-detection to enable fallback)",
+                effective_provider,
+            )
+            raise
+        if is_rate_limited_auth_error(primary_exc):
+            # Rate limits are recoverable on the same provider after a cooldown.
+            # Falling through to the chain would burn quotas across every
+            # provider in milliseconds — the "quota amplification" footgun.
+            # Existing rate-limit handling (cli.py:16128 → exit code 75) gets
+            # this task requeued; let it do its job.
+            logger.warning(
+                "primary provider %r is rate-limited; not attempting fallback "
+                "(letting rate-limit retry path handle it)",
+                effective_provider,
+            )
+            raise
+        if not fallback_chain:
+            # Nothing to fall back to — propagate original error verbatim.
+            raise
+        logger.warning(
+            "primary provider %r auth failed during worker startup (%s); "
+            "trying %d fallback provider(s) before giving up",
+            effective_provider, primary_exc, len(fallback_chain),
+        )
+        last_exc: Exception = primary_exc
+        for fb_idx, fb in enumerate(fallback_chain):
+            fb_provider = (fb.get("provider") or "").strip() or None
+            fb_model = (fb.get("model") or "").strip() or None
+            fb_base_url = (fb.get("base_url") or "").strip() or None
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=fb_provider,
+                    target_model=fb_model,
+                    explicit_base_url=fb_base_url,
+                )
+                # Successful fallback — update effective_model so AIAgent sees
+                # the right model for the provider we landed on.
+                new_effective_model = fb_model if fb_model else effective_model
+                logger.info(
+                    "worker startup recovered: fallback[%d] %s/%s healthy",
+                    fb_idx, fb_provider or "auto", fb_model or "<default>",
+                )
+                # Slice the chain so AIAgent's own runtime fallback loop only
+                # sees entries AFTER the one we just landed on. Avoids
+                # re-attempting the dead primary OR the entry we just used.
+                remaining = list(fallback_chain[fb_idx + 1:])
+                return runtime, new_effective_model, fb_idx, remaining
+            except AuthError as fb_exc:
+                logger.debug(
+                    "fallback[%d] %s/%s auth failed: %s",
+                    fb_idx, fb_provider or "auto", fb_model or "<default>", fb_exc,
+                )
+                last_exc = fb_exc
+                continue
+        # All fallbacks exhausted. Re-raise the last AuthError; cli.py's
+        # generic exit handling will surface it as a non-zero exit.
+        raise last_exc
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -314,10 +436,24 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
+    # Hoist the fallback chain once and reuse — avoids two reads of cfg and any
+    # TOCTOU window if cfg were mutated between calls.
+    _fb_chain = get_fallback_chain(cfg) or []
+    # Caller pinned model/provider explicitly on the CLI (e.g.
+    # `hermes -z --model grok-4.3 --provider xai-oauth ...`) → silent
+    # downgrade to a fallback would surprise them. Detect from the original
+    # args, not the resolved effective_* values.
+    _explicit_pin = bool((model or "").strip() or (provider or "").strip())
+    runtime, effective_model, _landed_idx, _remaining_fb = (
+        _resolve_runtime_with_fallback(
+            resolve_runtime_provider=resolve_runtime_provider,
+            effective_provider=effective_provider,
+            effective_model=effective_model,
+            explicit_base_url=explicit_base_url_from_alias,
+            fallback_chain=_fb_chain,
+            logger=logging.getLogger(__name__),
+            explicit_pin=_explicit_pin,
+        )
     )
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
@@ -328,9 +464,11 @@ def _run_agent(
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     session_db = _create_session_db_for_oneshot()
-    # Read the effective fallback chain from profile config so oneshot workers
-    # honour the same merge semantics as interactive CLI and gateway sessions.
-    _fb = get_fallback_chain(cfg)
+    # If we landed on a fallback during startup resolution, hand AIAgent only
+    # the entries AFTER the one we used — avoids re-trying the dead primary
+    # or the entry we just succeeded with when AIAgent's runtime fallback
+    # loop kicks in mid-conversation.
+    _fb = _remaining_fb
 
     agent = AIAgent(
         api_key=runtime.get("api_key"),
