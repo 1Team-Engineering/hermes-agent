@@ -188,17 +188,22 @@ class TestWorkspaceDiff:
             is None
         )
 
-    def test_no_implementation_claim_skipped(self, git_workspace: Path) -> None:
-        """Summary that doesn't claim code work doesn't trip the gate."""
-        assert (
-            verify_workspace_diff(
-                assignee="friday",
-                workspace_kind="dir",
-                workspace_path=str(git_workspace),
-                summary="Investigated the issue; recommendations in comment.",
-            )
-            is None
+    def test_build_role_with_no_diff_rejects_regardless_of_summary_verb(
+        self, git_workspace: Path,
+    ) -> None:
+        """After the PR-#11 self-review fix: build-role + dir/worktree
+        workspace REQUIRES a non-empty diff. The earlier verb-trigger
+        version was bypassed by writing the summary without
+        implementation verbs. Now even a verb-free summary fails when
+        no diff exists.
+        """
+        v = verify_workspace_diff(
+            assignee="friday",
+            workspace_kind="dir",
+            workspace_path=str(git_workspace),
+            summary="Investigated the issue; recommendations in comment.",
         )
+        assert v is not None
 
     def test_x_no_code_opt_out(self, git_workspace: Path) -> None:
         assert (
@@ -333,3 +338,242 @@ class TestStrayArtifacts:
         v = verify_no_stray_artifacts("dir", str(tmp_path))
         assert v is not None
         assert "tmp-scratch" in v.stray_paths
+
+    # === post-self-review fixes ===
+
+    def test_tracked_LICENSE_and_Dockerfile_not_flagged(
+        self, tmp_path: Path,
+    ) -> None:
+        """The PR-#11 self-review found that the original gate flagged
+        every repo's tracked LICENSE / Dockerfile / Makefile as stray
+        because they have no extension. Real repos legitimately track
+        these — they predate the worker by years.
+        """
+        _git_init(tmp_path)
+        (tmp_path / "LICENSE").write_text("MIT License\n")
+        (tmp_path / "Dockerfile").write_text("FROM alpine\n")
+        (tmp_path / "Makefile").write_text("all:\n\techo hi\n")
+        (tmp_path / "Vagrantfile").write_text("config\n")
+        (tmp_path / "README").write_text("project\n")
+        (tmp_path / "src.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+        assert verify_no_stray_artifacts("dir", str(tmp_path)) is None
+
+    def test_evidence_substring_in_legitimate_filename_not_flagged(
+        self, tmp_path: Path,
+    ) -> None:
+        """The original `evidence|.*-evidence|.*_evidence` regex was so
+        broad it matched `evidence-types.md` (a legitimate doc in the
+        security skills tree) and `scripts/evidence-store.py` (a
+        legitimate source file). After tightening, those paths pass."""
+        _git_init(tmp_path)
+        d = tmp_path / "optional-skills" / "security" / "references"
+        d.mkdir(parents=True)
+        (d / "evidence-types.md").write_text("# Evidence types\n")
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "evidence-store.py").write_text("def store(): pass\n")
+        (tmp_path / "src.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+        assert verify_no_stray_artifacts("dir", str(tmp_path)) is None
+
+    def test_untracked_no_extension_file_still_flagged(
+        self, tmp_path: Path,
+    ) -> None:
+        """Untracked files with no extension and no shebang remain
+        stray. (Tracked ones we trust; untracked ones the worker added
+        this run.)"""
+        _git_init(tmp_path)
+        (tmp_path / "src.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True)
+        # Add the literal failure-mode file as UNTRACKED.
+        (tmp_path / "all prior block evidence files").write_text("x\n")
+        v = verify_no_stray_artifacts("dir", str(tmp_path))
+        assert v is not None
+        assert "all prior block evidence files" in v.stray_paths
+
+    def test_evidence_dir_under_changes_still_flagged(
+        self, tmp_path: Path,
+    ) -> None:
+        """The agent-dashboard PR #1 failure: `changes/fix-14/evidence/`
+        subdirectory artifacts get flagged. Tightening the regex
+        shouldn't have lost this case."""
+        _git_init(tmp_path)
+        ed = tmp_path / "changes" / "v6-6" / "evidence"
+        ed.mkdir(parents=True)
+        (ed / "block-c-test-output.json").write_text("{}\n")
+        (tmp_path / "src.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+        v = verify_no_stray_artifacts("dir", str(tmp_path))
+        assert v is not None
+        assert any("evidence" in p for p in v.stray_paths)
+
+    def test_block_evidence_basename_still_flagged(
+        self, tmp_path: Path,
+    ) -> None:
+        """Files matching ``*-evidence.<ext>`` at any depth are flagged
+        even when their extension is legitimate. Catches the v6.6
+        artifact basenames without false-positive-ing on
+        evidence-types.md."""
+        _git_init(tmp_path)
+        d = tmp_path / "tests" / "data"
+        d.mkdir(parents=True)
+        (d / "block-c-evidence.json").write_text("{}\n")
+        (tmp_path / "src.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+        v = verify_no_stray_artifacts("dir", str(tmp_path))
+        assert v is not None
+        assert any("block-c-evidence.json" in p for p in v.stray_paths)
+
+
+# =====================================================================
+# Opt-out audit + integration through complete_task — PR-#11 self-review
+# =====================================================================
+
+
+import hermes_cli.kanban_db as kb
+from hermes_cli.kanban_db import InvalidOptOutError
+
+
+@pytest.fixture
+def board_conn_with_task(tmp_path, monkeypatch):
+    """A board with a single running task with a scratch workspace and
+    a recently-claimed started_at so runtime-floor doesn't fire."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+    conn = kb.connect(board="default")
+    import time
+    now = int(time.time())
+    started = now - 1000  # well above any floor
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, assignee, started_at, "
+        "  created_at, workspace_kind, workspace_path) "
+        "VALUES ('t_int', 'integration test task', 'running', 'jarvis', ?, "
+        "        ?, 'scratch', NULL)",
+        (started, now),
+    )
+    conn.commit()
+    yield conn
+    conn.close()
+
+
+class TestOptOutAudit:
+    def test_truthy_bool_opt_out_rejected(self, board_conn_with_task) -> None:
+        """``x_fast_justified: true`` (a literal bool) must NOT be a free
+        bypass — the gate requires a substantive string reason."""
+        with pytest.raises(InvalidOptOutError) as excinfo:
+            kb.complete_task(
+                board_conn_with_task, "t_int",
+                summary="quick", result="done",
+                metadata={"x_fast_justified": True},
+            )
+        assert excinfo.value.key == "x_fast_justified"
+
+    def test_short_string_opt_out_rejected(self, board_conn_with_task) -> None:
+        """Reason shorter than 20 chars (after strip) rejected."""
+        with pytest.raises(InvalidOptOutError):
+            kb.complete_task(
+                board_conn_with_task, "t_int",
+                summary="quick", result="done",
+                metadata={"x_no_code": "ok"},
+            )
+
+    def test_whitespace_only_opt_out_rejected(
+        self, board_conn_with_task,
+    ) -> None:
+        """A reason that's just whitespace can't satisfy the audit."""
+        with pytest.raises(InvalidOptOutError):
+            kb.complete_task(
+                board_conn_with_task, "t_int",
+                summary="quick", result="done",
+                metadata={"x_stray_ok": "                                "},
+            )
+
+    def test_real_reason_opt_out_accepted_and_audited(
+        self, board_conn_with_task,
+    ) -> None:
+        """A real string reason ≥20 chars is accepted and emits a
+        ``completion_opt_out_used`` event with the verbatim reason."""
+        ok = kb.complete_task(
+            board_conn_with_task, "t_int",
+            summary="docs-only reshuffle", result="done",
+            metadata={"x_fast_justified":
+                      "one-line rename verified by smoke test"},
+        )
+        assert ok
+        events = board_conn_with_task.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = 't_int' "
+            "AND kind = 'completion_opt_out_used'"
+        ).fetchall()
+        assert len(events) == 1
+        import json as _j
+        payload = _j.loads(events[0]["payload"])
+        assert (
+            payload["opt_outs"]["x_fast_justified"]
+            == "one-line rename verified by smoke test"
+        )
+
+    def test_false_opt_out_not_rejected_no_event(
+        self, board_conn_with_task,
+    ) -> None:
+        """``False`` and ``None`` are the natural absent values — they
+        skip validation and emit no opt-out event."""
+        ok = kb.complete_task(
+            board_conn_with_task, "t_int",
+            summary="done", result="done",
+            metadata={"x_fast_justified": False, "x_no_code": None},
+        )
+        assert ok
+        events = board_conn_with_task.execute(
+            "SELECT count(*) AS n FROM task_events WHERE task_id = 't_int' "
+            "AND kind = 'completion_opt_out_used'"
+        ).fetchone()
+        assert events["n"] == 0
+
+
+class TestCompleteTaskIntegration:
+    """End-to-end coverage through the public complete_task entrypoint.
+    These tests would have caught wiring regressions in PR #11 / #12
+    that the pure-function tests miss.
+    """
+
+    def test_friday_below_floor_blocks_and_emits_event(
+        self, board_conn_with_task,
+    ) -> None:
+        # Re-claim as friday with a recent started_at to trip the floor.
+        board_conn_with_task.execute(
+            "UPDATE tasks SET assignee = 'friday', started_at = ? "
+            "WHERE id = 't_int'",
+            (int(__import__("time").time()) - 10,),  # 10s ago, well below 5min
+        )
+        board_conn_with_task.commit()
+        with pytest.raises(kb.CompletionGateError):
+            kb.complete_task(
+                board_conn_with_task, "t_int",
+                summary="implemented thing", result="done",
+            )
+        # Task state preserved
+        row = board_conn_with_task.execute(
+            "SELECT status FROM tasks WHERE id = 't_int'"
+        ).fetchone()
+        assert row["status"] == "running"
+        events = board_conn_with_task.execute(
+            "SELECT kind FROM task_events WHERE task_id = 't_int' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert events["kind"] == "completion_blocked_v6_7_gates"
+
+    def test_clean_completion_passes_all_gates(
+        self, board_conn_with_task,
+    ) -> None:
+        """Default jarvis (no floor) + scratch workspace (no diff/stray
+        gate) + no opt-outs = clean pass."""
+        ok = kb.complete_task(
+            board_conn_with_task, "t_int",
+            summary="spawned chain", result="done",
+        )
+        assert ok
+        row = board_conn_with_task.execute(
+            "SELECT status FROM tasks WHERE id = 't_int'"
+        ).fetchone()
+        assert row["status"] == "done"

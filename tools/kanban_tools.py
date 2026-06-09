@@ -590,6 +590,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Your task is still in-flight (no state change). "
                     f"Address each violation above and retry kanban_complete."
                 )
+            except kb.InvalidOptOutError as opt_err:
+                # v6.7 opt-out validation rejected — the worker passed a
+                # truthy-but-non-substantive value for an opt-out key.
+                # Forces an audit-friendly string reason for every bypass.
+                return tool_error(
+                    f"{opt_err}\n"
+                    f"Your task is still in-flight (no state change)."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"

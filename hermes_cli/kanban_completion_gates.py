@@ -125,16 +125,6 @@ def verify_runtime_floor(
 REVIEW_ROLES = {"tony", "tchalla", "vision", "reviewer"}
 ORCHESTRATION_ROLES = {"jarvis", "pepper", "banner"}
 
-# Phrases workers used in fabricated completion summaries that should be
-# backed by a real diff. Conservative — only triggers the gate when the
-# worker has explicitly claimed code changes.
-_IMPLEMENTATION_CLAIM_PATTERNS = [
-    re.compile(r"\b(implement(?:ed|s)?|build(?:s|t)?|add(?:ed|s)?|"
-               r"creat(?:ed|es)?|wrote|wr(?:ites|ote)|ship(?:ped|s)?|"
-               r"land(?:ed|s)?|introduc(?:ed|es)?|refactor(?:ed|s)?|"
-               r"fix(?:ed|es)?|patch(?:ed|es)?)\b", re.IGNORECASE),
-]
-
 
 @dataclass(frozen=True)
 class WorkspaceDiffViolation:
@@ -153,10 +143,6 @@ class WorkspaceDiffViolation:
             f"with an honest reason. To skip this check on a doc-only or "
             f"genuinely-no-code task, set metadata={{\"x_no_code\": true}}."
         )
-
-
-def _summary_claims_implementation(summary: str) -> bool:
-    return any(p.search(summary or "") for p in _IMPLEMENTATION_CLAIM_PATTERNS)
 
 
 def _git_diff_stat_against_base(workspace_path: str) -> str:
@@ -228,8 +214,16 @@ def verify_workspace_diff(
         # Wrong / typo'd path is the dispatcher's problem to surface
         # elsewhere — we don't punish the worker for it.
         return None
-    if not _summary_claims_implementation(summary or ""):
-        return None
+    # Build-role workers on a real workspace ALWAYS need a non-empty
+    # diff. The earlier implementation only fired when the summary used
+    # a trigger verb ("implemented X"), which made the gate trivially
+    # bypassable: a worker that wrote "Per spec, the changes land in
+    # hermes_cli and tests pass" had no trigger verb and passed even
+    # with an empty branch. Build-role + workspace=dir/worktree implies
+    # code work; if the worker honestly produced no code, they should
+    # call ``kanban_block`` with a reason or opt out via
+    # ``x_no_code`` with a string justification. See PR-#11 self-
+    # review notes in hermes-jarvis#61.
     diff_stat = _git_diff_stat_against_base(workspace_path)
     # A real implementation produces SOME change line. We only reject when
     # the diff is empty / whitespace.
@@ -246,17 +240,46 @@ def verify_workspace_diff(
 # Repo-hygiene gate (#28)
 # =====================================================================
 
-# Patterns that mark a path as "stray orchestration artifact" rather than
-# real source. Matched against the path relative to the repo root, case
-# insensitive. Aligned with the agent-dashboard PR #1 audit findings (
-# `all prior block evidence files`, `commit-hash.txt`, `triage/v6.4-*`).
+# Patterns that mark a path as "stray orchestration artifact" rather
+# than real source. Matched against the path relative to the repo
+# root, case insensitive. Tightened after a self-review false-positive
+# audit: matching `evidence-types.md` or `LICENSE` or `Dockerfile`
+# would block every Friday completion. Patterns now match only
+# segments that are exactly the stray token (not legitimate filenames
+# that contain the token as a substring).
+#
+# Each pattern matches a PATH SEGMENT or a FULL BASENAME and only the
+# specific shapes we've seen as accidental commits in prior chains:
+# agent-dashboard PR #1's "all prior block evidence files", `commit-
+# hash.txt`, the `evidence/` artifact dirs under `changes/`, and
+# `triage/` report drops.
 _STRAY_PATH_PATTERNS = [
-    re.compile(r"(^|/)(evidence|.*-evidence|.*_evidence)(/|\b)", re.IGNORECASE),
+    # `evidence` as a directory segment, or basename `block-*-evidence.*`
+    # or `*-evidence.json/png/log/txt`. Excludes `evidence-types.md` (a
+    # legitimate source doc) by requiring the segment END at `evidence`.
+    re.compile(r"(^|/)evidence(/|$)", re.IGNORECASE),
+    re.compile(
+        r"(^|/)[^/]*-evidence\.(json|png|log|txt|md|yaml|yml)$",
+        re.IGNORECASE,
+    ),
     re.compile(r"(^|/)commit-hash(\.[a-z]+)?$", re.IGNORECASE),
-    re.compile(r"(^|/)triage/", re.IGNORECASE),
+    re.compile(r"(^|/)triage(/|$)", re.IGNORECASE),
     re.compile(r"(^|/)tmp-[^/]+$", re.IGNORECASE),
     re.compile(r"(^|/)all prior block evidence files$", re.IGNORECASE),
 ]
+
+# Tracked basenames that look like they MIGHT be stray (no extension)
+# but are universally legitimate source files in many repos. The
+# untracked-only scoping below already protects these in practice, but
+# we keep the allowlist as defense-in-depth for repos whose history
+# includes these as tracked files long before any swarm activity.
+_LEGITIMATE_NO_EXT_BASENAMES = {
+    "LICENSE", "LICENCE", "COPYING", "NOTICE", "AUTHORS",
+    "CHANGELOG", "CONTRIBUTORS", "MAINTAINERS", "OWNERS", "CODEOWNERS",
+    "Dockerfile", "Makefile", "Vagrantfile", "Procfile", "Brewfile",
+    "Rakefile", "Gemfile", "Guardfile", "Capfile", "Jenkinsfile",
+    "Containerfile", "Earthfile", "README",
+}
 
 
 @dataclass(frozen=True)
@@ -285,26 +308,39 @@ def _has_shebang(path: str) -> bool:
         return False
 
 
-def _stray_path_score(repo_root: str, rel_path: str) -> bool:
-    """True if ``rel_path`` looks like a stray artifact."""
+def _stray_path_score(repo_root: str, rel_path: str, *, is_tracked: bool) -> bool:
+    """True if ``rel_path`` looks like a stray artifact.
+
+    The specific stray patterns apply to BOTH tracked and untracked
+    files (a worker who actually committed ``commit-hash.txt`` is just
+    as wrong as one who left it untracked). The fuzzy
+    no-extension/no-shebang heuristic only applies to UNTRACKED files —
+    repos legitimately track LICENSE / Dockerfile / Makefile, and
+    blaming a worker for files that were in main before they started is
+    a false positive that teaches the swarm to opt out reflexively.
+    """
     norm = rel_path.replace("\\", "/")
     if any(p.search(norm) for p in _STRAY_PATH_PATTERNS):
         return True
-    # Tracked file with no extension and no shebang — the "all prior block
-    # evidence files" failure mode.
+    if is_tracked:
+        return False
     base = os.path.basename(norm)
+    if base in _LEGITIMATE_NO_EXT_BASENAMES:
+        return False
     if "." not in base and not _has_shebang(os.path.join(repo_root, rel_path)):
         return True
     return False
 
 
-def _list_workspace_files(workspace_path: str) -> list[str]:
-    """Return the union of `git ls-files` (tracked) and `git ls-files
-    --others --exclude-standard` (untracked & not gitignored), as relative
-    paths. Empty list on any git error.
+def _list_workspace_files_split(
+    workspace_path: str,
+) -> tuple[list[str], list[str]]:
+    """Return ``(tracked, untracked)`` lists of paths in ``workspace_path``.
+
+    Untracked respects .gitignore. Empty lists on any git error.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
-        return []
+        return [], []
 
     def _run(args: list[str]) -> Optional[str]:
         try:
@@ -318,15 +354,14 @@ def _list_workspace_files(workspace_path: str) -> list[str]:
             return None
         return out.stdout
 
-    tracked = _run(["git", "ls-files"]) or ""
-    untracked = _run(["git", "ls-files", "--others", "--exclude-standard"]) or ""
-    paths = set()
-    for blob in (tracked, untracked):
-        for line in blob.splitlines():
-            line = line.strip()
-            if line:
-                paths.add(line)
-    return sorted(paths)
+    def _split(blob: Optional[str]) -> list[str]:
+        if not blob:
+            return []
+        return [ln.strip() for ln in blob.splitlines() if ln.strip()]
+
+    tracked = _split(_run(["git", "ls-files"]))
+    untracked = _split(_run(["git", "ls-files", "--others", "--exclude-standard"]))
+    return tracked, untracked
 
 
 def verify_no_stray_artifacts(
@@ -348,8 +383,15 @@ def verify_no_stray_artifacts(
         return None
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
-    stray = [p for p in _list_workspace_files(workspace_path)
-             if _stray_path_score(workspace_path, p)]
+    tracked, untracked = _list_workspace_files_split(workspace_path)
+    stray: list[str] = []
+    for p in tracked:
+        if _stray_path_score(workspace_path, p, is_tracked=True):
+            stray.append(p)
+    for p in untracked:
+        if _stray_path_score(workspace_path, p, is_tracked=False):
+            stray.append(p)
+    stray = sorted(set(stray))
     if not stray:
         return None
     return StrayArtifactViolation(

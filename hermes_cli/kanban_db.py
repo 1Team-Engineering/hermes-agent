@@ -3566,6 +3566,49 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+_V67_OPT_OUT_MIN_REASON_LEN = 20
+
+
+class InvalidOptOutError(ValueError):
+    """Raised when a v6.7 gate opt-out (``x_fast_justified`` /
+    ``x_no_code`` / ``x_stray_ok``) is set to a non-string or too-short
+    value.
+
+    Each opt-out is an explicit auditable bypass — it MUST be a string
+    of at least :data:`_V67_OPT_OUT_MIN_REASON_LEN` non-whitespace
+    characters explaining WHY the bypass is justified. Truthy booleans
+    or empty strings (``True``, ``"x"``, ``"ok"``) get rejected so the
+    opt-out is not a free keyword bypass for the gate. See review of
+    PR #11 in hermes-jarvis#61 thread.
+    """
+
+    def __init__(self, completing_task_id: str, key: str, value):
+        self.completing_task_id = completing_task_id
+        self.key = key
+        self.value = value
+        kind = type(value).__name__
+        super().__init__(
+            f"kanban_complete blocked: metadata.{key} must be a string of "
+            f"at least {_V67_OPT_OUT_MIN_REASON_LEN} non-whitespace characters "
+            f"explaining the bypass; got {kind} {value!r}. "
+            f"Either drop {key} and address the gate's finding, or pass "
+            f"a real justification like '{key}: trivially-one-line-rename "
+            f"verified by smoke test'."
+        )
+
+
+def _validate_opt_out(task_id: str, key: str, raw) -> Optional[str]:
+    """Return a normalized opt-out reason, or ``None`` when the key isn't
+    set. Raises :class:`InvalidOptOutError` when the value is truthy but
+    not a substantive string.
+    """
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, str) or len(raw.strip()) < _V67_OPT_OUT_MIN_REASON_LEN:
+        raise InvalidOptOutError(task_id, key, raw)
+    return raw.strip()
+
+
 def _v6_7_run_completion_gates(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3580,10 +3623,18 @@ def _v6_7_run_completion_gates(
     delegates to the pure gate functions in ``kanban_completion_gates``.
     Returns an empty list when all gates pass.
 
-    Workers may opt out of individual gates via per-call metadata keys
-    (``x_fast_justified``, ``x_no_code``, ``x_stray_ok``) which surface as
-    the gate functions' ``allow_*`` kwargs. Opt-outs are recorded as part
-    of the completed event for audit.
+    Workers may opt out of individual gates via per-call metadata keys.
+    Each opt-out value MUST be a non-empty string of at least
+    :data:`_V67_OPT_OUT_MIN_REASON_LEN` chars explaining the bypass
+    (truthy bools or short strings are rejected with
+    :class:`InvalidOptOutError`). Opt-outs that ARE accepted get
+    emitted as a ``completion_opt_out_used`` event so the bypass is
+    auditable downstream.
+
+    Opt-out keys (string only):
+        - ``x_fast_justified`` — skip runtime-floor (#64)
+        - ``x_no_code`` — skip workspace-diff (#62)
+        - ``x_stray_ok`` — skip repo-hygiene (#28)
     """
     row = conn.execute(
         "SELECT assignee, workspace_kind, workspace_path, started_at "
@@ -3593,9 +3644,25 @@ def _v6_7_run_completion_gates(
     if row is None:
         return []
     md = metadata or {}
-    fast_ok = bool(md.get("x_fast_justified"))
-    no_code = bool(md.get("x_no_code"))
-    stray_ok = bool(md.get("x_stray_ok"))
+    fast_ok_reason = _validate_opt_out(task_id, "x_fast_justified", md.get("x_fast_justified"))
+    no_code_reason = _validate_opt_out(task_id, "x_no_code", md.get("x_no_code"))
+    stray_ok_reason = _validate_opt_out(task_id, "x_stray_ok", md.get("x_stray_ok"))
+    accepted_opt_outs = {
+        k: v for k, v in (
+            ("x_fast_justified", fast_ok_reason),
+            ("x_no_code", no_code_reason),
+            ("x_stray_ok", stray_ok_reason),
+        ) if v is not None
+    }
+    if accepted_opt_outs:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_opt_out_used",
+                {"opt_outs": accepted_opt_outs},
+            )
+    fast_ok = fast_ok_reason is not None
+    no_code = no_code_reason is not None
+    stray_ok = stray_ok_reason is not None
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
