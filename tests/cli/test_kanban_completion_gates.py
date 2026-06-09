@@ -229,6 +229,25 @@ class TestWorkspaceDiff:
             is None
         )
 
+    def test_empty_summary_does_not_crash(self, git_workspace: Path) -> None:
+        """Regression: empty/None summary on a build role with no diff
+        previously crashed `splitlines()[0]` before the gate could
+        surface the violation. Now the violation lands cleanly."""
+        v_empty = verify_workspace_diff(
+            assignee="friday",
+            workspace_kind="dir",
+            workspace_path=str(git_workspace),
+            summary="",
+        )
+        assert isinstance(v_empty, WorkspaceDiffViolation)
+        v_none = verify_workspace_diff(
+            assignee="friday",
+            workspace_kind="dir",
+            workspace_path=str(git_workspace),
+            summary=None,
+        )
+        assert isinstance(v_none, WorkspaceDiffViolation)
+
 
 # =====================================================================
 # verify_no_stray_artifacts — #28

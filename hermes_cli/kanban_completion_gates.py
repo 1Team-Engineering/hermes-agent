@@ -229,7 +229,13 @@ def verify_workspace_diff(
     # the diff is empty / whitespace.
     if diff_stat and diff_stat.strip():
         return None
-    summary_excerpt = (summary or "").strip().splitlines()[0][:200]
+    # Defensive — empty/None summary used to crash here on
+    # splitlines()[0] before the gate could surface its violation.
+    # Fall back to an empty excerpt so the violation is still
+    # constructed cleanly (the gate's CompletionGateError message still
+    # tells the worker what to do).
+    summary_lines = (summary or "").strip().splitlines()
+    summary_excerpt = summary_lines[0][:200] if summary_lines else ""
     return WorkspaceDiffViolation(
         assignee=assignee, workspace_path=workspace_path,
         summary_excerpt=summary_excerpt, diff_stat=diff_stat,
