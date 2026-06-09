@@ -565,8 +565,15 @@ def _parse_field(text: str, *path: str) -> Optional[tuple[str, str]]:
 _ADVERSARIAL_BULLET_RE = re.compile(r"(?m)^\s*[-*]\s+\S+")
 _ADVERSARIAL_ENV_VAR_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b\s*:")
 _ADVERSARIAL_PATH_RE = re.compile(r"\b[\w-]+/[\w./-]+")
+# Code-only extensions. Docs/config extensions (md/yaml/yml/json/txt)
+# are intentionally excluded — workers commonly mention "README.md" or
+# "config.yaml" in prose, which gave a marker-padding bypass through
+# the adversarial structure check. If a reviewer's evidence genuinely
+# touches a yaml/json/md path, they can still satisfy the gate via the
+# path-with-slash regex above (e.g. "configs/app.yaml" matches
+# _ADVERSARIAL_PATH_RE).
 _ADVERSARIAL_SOURCE_FILE_RE = re.compile(
-    r"\b[\w-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|rb|yaml|yml|json|md)\b",
+    r"\b[\w-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|rb|kt|swift|c|cpp|cc|h|hpp|cs|scala|clj|ex|exs|erl|lua|sh)\b",
     re.IGNORECASE,
 )
 

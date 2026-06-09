@@ -1021,6 +1021,69 @@ test_quality:
         )
         assert v is None
 
+    def test_prose_padded_with_readme_md_rejected(self) -> None:
+        """Second self-review found that the structure check accepted
+        prose that name-dropped README.md / config.yaml. After dropping
+        docs extensions from the source-file alternation, this bypass
+        is closed."""
+        prose_padding = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars: see README.md elsewhere for general environment safety guidance
+  request_inputs: discussed in config.yaml above; nothing concrete here either
+  file_paths: notes.md handles the overview; we're broadly compliant
+  external_io: handled per docs.json conventions across the codebase
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=prose_padding,
+        )
+        assert v is not None
+        for f in (
+            "adversarial_pass.env_vars",
+            "adversarial_pass.request_inputs",
+            "adversarial_pass.file_paths",
+            "adversarial_pass.external_io",
+        ):
+            assert f in v.missing_fields, (
+                f"expected {f} in {v.missing_fields} — README.md / config.yaml "
+                "prose name-drop should not satisfy the gate"
+            )
+
+    def test_real_yaml_path_with_slash_still_passes(self) -> None:
+        """Honest yaml/json/md mentions inside a real path (e.g.
+        ``configs/app.yaml``) still satisfy the path-with-slash regex."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars:
+    - configs/env.example: bounds in lib/ingest.ts
+  request_inputs:
+    - schemas/inputs.yaml validated at app/api/route.ts:42
+  file_paths:
+    - lib/ingest.ts only opens paths under ~/.hermes/
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=verdict,
+        )
+        assert v is None
+
     def test_adversarial_bullet_list_passes(self) -> None:
         """The most common honest shape: bullet list under each section."""
         verdict = """\
