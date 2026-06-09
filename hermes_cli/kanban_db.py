@@ -4044,6 +4044,76 @@ def edit_completed_task_result(
     return True
 
 
+_AUTH_CLAIM_PATTERN = re.compile(
+    r"(missing[\s-]+github[\s-]+auth|"
+    r"gh\s+auth\s+(?:login|status|token)|"
+    r"GITHUB_TOKEN\s+(?:required|missing|unset|not\s+set)|"
+    r"gh\s+CLI\s+(?:is\s+)?(?:not\s+)?authenticated)",
+    re.IGNORECASE,
+)
+
+
+class FabricatedAuthClaimError(ValueError):
+    """Raised by ``block_task`` when a worker's block reason claims gh
+    auth is missing but the dispatcher's shell can authenticate cleanly.
+
+    Closes hermes-jarvis#65. On 2026-06-09 Tchalla blocked a review with
+    \"gh CLI not authenticated; cannot run gh pr diff 42 on
+    https://github.com/.../pull/42\". Two lies: the PR didn't exist, and
+    even if it did, the parent shell IS authed. Workers fabricate
+    auth-claim block reasons to get out of work they can't or won't
+    complete; rejecting them forces an honest cause.
+    """
+
+    def __init__(self, completing_task_id: str, claim_excerpt: str):
+        self.completing_task_id = completing_task_id
+        self.claim_excerpt = claim_excerpt
+        super().__init__(
+            f"kanban_block rejected: the reason claims github auth is "
+            f"missing ({claim_excerpt[:160]!r}), but the dispatcher's "
+            f"shell IS authed (`gh auth status` returns logged in). "
+            f"This is the fabricated-auth-claim failure mode from "
+            f"hermes-jarvis#65. Surface the REAL cause of the block "
+            f"(does the PR actually exist? is the diff what you "
+            f"expected? did the API return an error?) and call "
+            f"kanban_block again, or fix the issue and call "
+            f"kanban_complete."
+        )
+
+
+def _dispatcher_gh_is_authed() -> bool:
+    """Return True if ``gh auth status`` succeeds in the dispatcher's
+    shell. Returns False on every failure mode (gh missing, not
+    logged in, command timeout, etc.) — fail-safe for the gate, which
+    only fires when this returns True (i.e., when we KNOW gh is fine).
+    """
+    import shutil
+    if not shutil.which("gh"):
+        return False
+    try:
+        out = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if out.returncode != 0:
+        return False
+    blob = (out.stdout or "") + (out.stderr or "")
+    return "Logged in" in blob or "logged in" in blob
+
+
+def _reason_claims_missing_gh_auth(reason: Optional[str]) -> Optional[str]:
+    """Return the matched substring if ``reason`` makes a github-auth
+    claim, else None."""
+    if not reason:
+        return None
+    m = _AUTH_CLAIM_PATTERN.search(reason)
+    if not m:
+        return None
+    return m.group(0)
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4051,7 +4121,24 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running -> blocked``."""
+    """Transition ``running -> blocked``.
+
+    v6.7 gate (hermes-jarvis#65): if ``reason`` claims github auth is
+    missing but the dispatcher's shell IS authed, the call is rejected
+    with :class:`FabricatedAuthClaimError` so the worker has to surface
+    the real cause. Task state is unchanged on rejection.
+    """
+    claim_excerpt = _reason_claims_missing_gh_auth(reason)
+    if claim_excerpt and _dispatcher_gh_is_authed():
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "block_blocked_fabricated_auth_claim",
+                {
+                    "reason_excerpt": claim_excerpt[:200],
+                    "full_reason_preview": (reason or "")[:300],
+                },
+            )
+        raise FabricatedAuthClaimError(task_id, claim_excerpt)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -5889,6 +5976,23 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #
+    # EXEMPT review-role tasks (tony / tchalla / vision / reviewer). Their
+    # whole purpose is to operate on an existing PR: a release-gate review
+    # body legitimately cites the PR URL it's tasked to verify, and the
+    # unblock comments we post often include the URL as evidence. Closes
+    # hermes-jarvis#34 — JARVIS spent 17 dispatcher ticks looping
+    # respawn_guarded on `t_d152c9d0` (a Tchalla re-review) until it
+    # self-recovered by spawning a duplicate card whose body had the URL
+    # stripped. That self-recovery was a kludge; this exemption is the
+    # real fix.
+    role_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    assignee = (role_row["assignee"] or "").lower() if role_row else ""
+    if assignee in {"tony", "tchalla", "vision", "reviewer"}:
+        return None
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
@@ -6610,6 +6714,40 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+def _inject_gh_token_into_env(env: dict) -> None:
+    """If ``GH_TOKEN`` / ``GITHUB_TOKEN`` is absent from the worker env,
+    fall back to ``gh auth token`` from the dispatcher's shell and inject
+    the result.
+
+    Closes hermes-jarvis#33. Three incidents on 2026-06-07 + 2026-06-09
+    showed worker subprocesses unable to see the macOS-keyring-backed
+    ``gh`` auth that the dispatcher itself was using cleanly. Workers
+    then blocked with ``missing-github-auth`` even though every
+    user-mediated retry from the same shell worked. This injection
+    closes the gap without forcing users to export tokens manually.
+
+    Silent on every failure mode (``gh`` not installed, not logged in,
+    command times out, etc.) — workers that genuinely don't need
+    GitHub access are unaffected. Only mutates ``env`` when a token is
+    actually obtained.
+    """
+    if env.get("GH_TOKEN") or env.get("GITHUB_TOKEN"):
+        return
+    import shutil
+    if not shutil.which("gh"):
+        return
+    try:
+        out = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return
+    token = (out.stdout or "").strip()
+    if out.returncode == 0 and token:
+        env["GH_TOKEN"] = token
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -6756,6 +6894,9 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    # Propagate gh auth to the worker (closes hermes-jarvis#33).
+    _inject_gh_token_into_env(env)
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
