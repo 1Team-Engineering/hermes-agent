@@ -554,8 +554,56 @@ def _parse_field(text: str, *path: str) -> Optional[tuple[str, str]]:
     return _parse_field(body_text, *path[1:])
 
 
-def _field_present(field_key: str, text: str) -> bool:
-    """True if the verdict text shows the field with a real value."""
+# For adversarial_pass.* fields, a substantive value must either be
+# an explicit empty marker or contain a structural cue that the
+# reviewer actually enumerated something: a bullet item, an env-var
+# token (UPPER_SNAKE), a path-like substring (a/b), a file extension
+# of source code shape, or a colon-separated "<name>: <bound>" on the
+# same line. Pure prose ≥20 chars no longer satisfies the gate — that
+# was the same shape as the prose-evidence bypass we fixed for
+# test_quality.evidence (hermes-jarvis#61 N2 self-review).
+_ADVERSARIAL_BULLET_RE = re.compile(r"(?m)^\s*[-*]\s+\S+")
+_ADVERSARIAL_ENV_VAR_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b\s*:")
+_ADVERSARIAL_PATH_RE = re.compile(r"\b[\w-]+/[\w./-]+")
+_ADVERSARIAL_SOURCE_FILE_RE = re.compile(
+    r"\b[\w-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|rb|yaml|yml|json|md)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_adversarial_structure(text: str) -> bool:
+    return bool(
+        _ADVERSARIAL_BULLET_RE.search(text)
+        or _ADVERSARIAL_ENV_VAR_RE.search(text)
+        or _ADVERSARIAL_PATH_RE.search(text)
+        or _ADVERSARIAL_SOURCE_FILE_RE.search(text)
+    )
+
+# Empty-marker tokens accepted as honest declarations.
+_HONEST_EMPTY_MARKERS = {"none", "[]", "{}", "n/a"}
+
+
+def _adversarial_value_substantive(captured: str) -> bool:
+    """True if an adversarial_pass.* value's content shows the reviewer
+    enumerated structure rather than padded with prose. Honest empty
+    markers are accepted."""
+    stripped = captured.strip()
+    if not stripped:
+        return False
+    head = stripped.split("\n", 1)[0].strip().lower()
+    if head in _HONEST_EMPTY_MARKERS:
+        return True
+    return _has_adversarial_structure(stripped)
+
+
+def _field_present(field_key: str, text: str, *, code_change_context: bool = False) -> bool:
+    """True if the verdict text shows the field with a real value.
+
+    ``code_change_context`` (when True) forbids the honest-empty escape
+    on ``test_quality.evidence`` — a reviewer of code touching HTTP /
+    server surfaces must produce real test citations, not a bare
+    ``none``. Closes hermes-jarvis#61 N6 self-review note.
+    """
     if field_key == "test_quality.imports_match_deliverable_entrypoints":
         parsed = _parse_field(text or "", "test_quality", "imports_match_deliverable_entrypoints")
         if parsed is None:
@@ -582,20 +630,32 @@ def _field_present(field_key: str, text: str) -> bool:
     inline, body = parsed
     inline = inline.strip()
     body = body.strip("\n")
-    if inline:
-        if inline.lower() in {"none", "[]", "{}", "n/a"}:
-            return True
-        if field_key.startswith("adversarial_pass.") and len(inline) >= MIN_FIELD_VALUE_LEN:
-            return True
-        return False
-    if not _captured_value_substantive(body):
-        return False
+
+    # adversarial_pass.* — structure-required.
+    if field_key.startswith("adversarial_pass."):
+        if inline:
+            return _adversarial_value_substantive(inline)
+        return _adversarial_value_substantive(body)
+
+    # test_quality.evidence — citation-required, or honest-empty
+    # (unless code_change_context forbids the empty escape).
     if field_key == "test_quality.evidence":
-        head = body.strip().split("\n", 1)[0].strip()
-        if head.lower() in {"[]", "{}", "none", "n/a"}:
-            return True
+        if inline:
+            inline_low = inline.lower()
+            if inline_low in _HONEST_EMPTY_MARKERS:
+                return not code_change_context
+            return False  # inline prose like "evidence: see above" never qualifies
+        if not _captured_value_substantive(body):
+            return False
+        head = body.strip().split("\n", 1)[0].strip().lower()
+        if head in _HONEST_EMPTY_MARKERS:
+            return not code_change_context
         return bool(_EVIDENCE_CITATION_RE.search(body))
-    return True
+
+    # Other multi-key fields (currently none) fall through.
+    if inline:
+        return inline.lower() in _HONEST_EMPTY_MARKERS or len(inline) >= MIN_FIELD_VALUE_LEN
+    return _captured_value_substantive(body)
 
 
 def verify_reviewer_fields(
@@ -631,17 +691,24 @@ def verify_reviewer_fields(
         "test_quality.imports_match_deliverable_entrypoints",
         "test_quality.evidence",
     ]
-    if _body_triggers_adversarial(body or ""):
+    code_change = _body_triggers_adversarial(body or "")
+    if code_change:
         required.extend([
             "adversarial_pass.env_vars",
             "adversarial_pass.request_inputs",
             "adversarial_pass.file_paths",
             "adversarial_pass.external_io",
         ])
-    missing = [f for f in required if not _field_present(f, text)]
+    missing = [
+        f for f in required
+        if not _field_present(f, text, code_change_context=code_change)
+    ]
     if not missing:
         return None
-    body_excerpt = (body or "").strip().splitlines()[0][:200]
+    # Defensive — empty/None body used to crash on splitlines()[0]
+    # before the gate could surface its violation.
+    body_lines = (body or "").strip().splitlines()
+    body_excerpt = body_lines[0][:200] if body_lines else ""
     return MissingReviewerFieldViolation(
         assignee=assignee, missing_fields=tuple(missing),
         body_excerpt=body_excerpt,

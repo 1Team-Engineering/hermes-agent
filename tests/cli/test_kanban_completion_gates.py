@@ -897,3 +897,153 @@ class TestReviewerFieldsIntegration:
             summary="approved", result=_GOOD_FULL,
         )
         assert ok
+
+
+# =====================================================================
+# Self-review fixes for PR #12 — N1 (empty body), N2 (inline-prose
+# bypass on adversarial_pass), N6 (evidence:none in code-change context)
+# =====================================================================
+
+
+class TestReviewerFieldsSelfReviewFixes:
+    def test_empty_body_does_not_crash(self) -> None:
+        """Regression for N1: empty body used to crash splitlines()[0]
+        before the gate could surface the violation."""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="",
+            result="verdict: approve\n",
+        )
+        assert isinstance(v, MissingReviewerFieldViolation)
+
+    def test_none_body_does_not_crash(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body=None,
+            result="verdict: approve\n",
+        )
+        assert isinstance(v, MissingReviewerFieldViolation)
+
+    def test_adversarial_inline_prose_bypass_rejected(self) -> None:
+        """The N2 self-review finding: an inline value of 51 chars of
+        prose used to satisfy adversarial_pass.<field>. Now requires
+        structural markers (bullet, ENV_VAR:, path, file extension)."""
+        prose_verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars: see above explanation about general env safety
+  request_inputs: handled with care, full coverage everywhere
+  file_paths: standard set of paths, all are looked after
+  external_io: same as above, addressed in prior commit
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=prose_verdict,
+        )
+        assert v is not None
+        for f in (
+            "adversarial_pass.env_vars",
+            "adversarial_pass.request_inputs",
+            "adversarial_pass.file_paths",
+            "adversarial_pass.external_io",
+        ):
+            assert f in v.missing_fields, f"expected {f} in {v.missing_fields}"
+
+    def test_adversarial_structured_inline_passes(self) -> None:
+        """Inline values WITH path/env-var/extension cues pass — these
+        are honest one-line enumerations."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars: DASH_DB: allowlist enforced in lib/ingest.ts:88
+  request_inputs: route.ts:42 parses with zod schema
+  file_paths: lib/ingest.ts only opens paths under ~/.hermes/
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_evidence_none_blocked_when_body_triggers_adversarial(self) -> None:
+        """N6 self-review: ``evidence: none`` is normally an honest-
+        empty escape, but when the body indicates code-touching review
+        the reviewer MUST produce real test citations."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence: none
+
+adversarial_pass:
+  env_vars: []
+  request_inputs: []
+  file_paths: []
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/metrics/route.ts",
+            result=verdict,
+        )
+        assert v is not None
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_evidence_none_allowed_for_pure_docs_review(self) -> None:
+        """The escape stays valid for non-code reviews."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable: docs reshuffle, no entrypoints
+  evidence: none
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the README rewrite",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_adversarial_bullet_list_passes(self) -> None:
+        """The most common honest shape: bullet list under each section."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/integration.test.ts:42 invokes route.ts:GET
+
+adversarial_pass:
+  env_vars:
+    - DASH_DB
+    - HERMES_KANBAN_DB
+  request_inputs:
+    - none
+  file_paths:
+    - lib/ingest.ts paths only
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review app/api/metrics changes",
+            result=verdict,
+        )
+        assert v is None
