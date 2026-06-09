@@ -4044,11 +4044,25 @@ def edit_completed_task_result(
     return True
 
 
+# The auth-claim pattern is anchored to leading position (or right after
+# a ``cause:`` / ``blocker:`` prefix) so honest diagnoses that mention
+# auth in passing don't false-positive. Self-review note from
+# hermes-jarvis#61: the original pattern matched any occurrence in 300
+# chars, including the EXACT honest cause workers should surface (e.g.
+# ``investigated: gh CLI is authenticated; the real issue is PR 42
+# doesn't exist``). Now the claim must be the leading substring of the
+# reason after stripping whitespace/labels.
+_AUTH_CLAIM_PHRASES = (
+    r"missing[\s-]+github[\s-]+auth"
+    r"|gh\s+auth\s+(?:login|status|token)\s+(?:required|missing|fails|failed|not\s+available)"
+    r"|GITHUB_TOKEN\s+(?:required|missing|unset|not\s+set)"
+    r"|gh\s+CLI\s+(?:is\s+)?not\s+authenticated"
+    r"|cannot\s+(?:run|invoke)\s+`?gh\s+"
+)
+
 _AUTH_CLAIM_PATTERN = re.compile(
-    r"(missing[\s-]+github[\s-]+auth|"
-    r"gh\s+auth\s+(?:login|status|token)|"
-    r"GITHUB_TOKEN\s+(?:required|missing|unset|not\s+set)|"
-    r"gh\s+CLI\s+(?:is\s+)?(?:not\s+)?authenticated)",
+    r"^\s*(?:(?:cause|blocker|reason|infra)\s*:\s*)?"
+    r"(" + _AUTH_CLAIM_PHRASES + r")",
     re.IGNORECASE,
 )
 
@@ -5986,12 +6000,26 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # self-recovered by spawning a duplicate card whose body had the URL
     # stripped. That self-recovery was a kludge; this exemption is the
     # real fix.
-    role_row = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    #
+    # Bounded: the exemption only applies while consecutive_failures <
+    # max_retries (the same brake every other path observes). If a
+    # buggy review profile keeps crashing on claim, the third failure
+    # still trips the breaker and the task gets auto-blocked — without
+    # this bound a flapping review could respawn unboundedly while the
+    # URL stayed in its body. Self-review note from hermes-jarvis#61.
+    row = conn.execute(
+        "SELECT assignee, consecutive_failures, max_retries "
+        "  FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
-    assignee = (role_row["assignee"] or "").lower() if role_row else ""
+    assignee = (row["assignee"] or "").lower() if row else ""
     if assignee in {"tony", "tchalla", "vision", "reviewer"}:
-        return None
+        cf = row["consecutive_failures"] or 0
+        mr = row["max_retries"] if row["max_retries"] is not None else DEFAULT_FAILURE_LIMIT
+        if cf < mr:
+            return None
+        # Otherwise fall through to the active_pr check (and let
+        # auto_block catch the breaker shortly).
 
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(

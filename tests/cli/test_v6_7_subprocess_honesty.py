@@ -314,3 +314,133 @@ class TestBlockGate:
         ).fetchone()
         assert events is not None
         assert events["kind"] == "block_blocked_fabricated_auth_claim"
+
+
+# =====================================================================
+# Self-review fixes for PR #13 — tighter auth pattern
+# =====================================================================
+
+
+class TestAuthClaimNotLeading:
+    """The original pattern matched any occurrence in 300 chars,
+    including the EXACT honest cause workers should surface. After
+    tightening, the claim must be the LEADING substring of the reason
+    (optionally after a ``cause:``/``blocker:``/``reason:``/``infra:``
+    prefix).
+    """
+
+    def test_honest_diagnosis_does_not_match(self) -> None:
+        """The exact false positive from the self-review: a worker
+        surfacing an honest diagnosis that MENTIONS gh auth status in
+        passing must not trigger the gate."""
+        reason = (
+            "investigated: gh CLI is authenticated; the real issue is "
+            "that PR 42 doesn't exist on the remote."
+        )
+        assert _reason_claims_missing_gh_auth(reason) is None
+
+    def test_documentation_mention_does_not_match(self) -> None:
+        assert (
+            _reason_claims_missing_gh_auth(
+                "documenting that gh auth login is needed in setup docs "
+                "as a follow-up; not blocking this task"
+            )
+            is None
+        )
+
+    def test_handoff_context_mention_does_not_match(self) -> None:
+        assert (
+            _reason_claims_missing_gh_auth(
+                "used gh auth token to fetch the token earlier in the task "
+                "but it's now stale; primary blocker is API rate limit"
+            )
+            is None
+        )
+
+    def test_wrong_account_diagnosis_does_not_match(self) -> None:
+        assert (
+            _reason_claims_missing_gh_auth(
+                "gh CLI is authenticated for the wrong account; switch "
+                "needed but that's a separate setup task"
+            )
+            is None
+        )
+
+    def test_cause_prefix_still_matches(self) -> None:
+        """A worker that prefixes the claim with ``cause:`` or
+        similar is still caught."""
+        assert (
+            _reason_claims_missing_gh_auth(
+                "cause: gh CLI is not authenticated; cannot run gh pr diff"
+            )
+            is not None
+        )
+
+    def test_blocker_prefix_still_matches(self) -> None:
+        assert (
+            _reason_claims_missing_gh_auth(
+                "blocker: GITHUB_TOKEN required for this operation"
+            )
+            is not None
+        )
+
+    def test_legacy_leading_form_still_matches(self) -> None:
+        """The 2026-06-09 Tchalla case still trips the gate."""
+        assert (
+            _reason_claims_missing_gh_auth(
+                "missing-github-auth: gh token for jarvis-stark-ops is "
+                "invalid, so I cannot post the required PR comment"
+            )
+            is not None
+        )
+
+
+class TestRespawnExemptionBounded:
+    """The exemption now respects the failure breaker — a flapping
+    review can respawn at most max_retries times before falling back
+    to the active_pr guard (and shortly after, auto_block)."""
+
+    def test_review_under_limit_exempted(self, board_conn) -> None:
+        import time
+        now = int(time.time())
+        board_conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, "
+            "  consecutive_failures, max_retries, created_at, "
+            "  workspace_kind, workspace_path) "
+            "VALUES ('t_rb1', 'review', 'ready', 'tchalla', 1, 3, ?, "
+            "        'scratch', NULL)",
+            (now,),
+        )
+        board_conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES ('t_rb1', 'kaipo', "
+            "        'pr at https://github.com/o/r/pull/1', ?)",
+            (now,),
+        )
+        board_conn.commit()
+        assert check_respawn_guard(board_conn, "t_rb1") is None
+
+    def test_review_at_limit_falls_through_to_active_pr(
+        self, board_conn,
+    ) -> None:
+        """Once consecutive_failures >= max_retries, the exemption
+        no longer applies and the URL signal trips the guard normally
+        (and the breaker will catch it shortly)."""
+        import time
+        now = int(time.time())
+        board_conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, "
+            "  consecutive_failures, max_retries, created_at, "
+            "  workspace_kind, workspace_path) "
+            "VALUES ('t_rb2', 'review', 'ready', 'tchalla', 3, 3, ?, "
+            "        'scratch', NULL)",
+            (now,),
+        )
+        board_conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES ('t_rb2', 'kaipo', "
+            "        'pr at https://github.com/o/r/pull/1', ?)",
+            (now,),
+        )
+        board_conn.commit()
+        assert check_respawn_guard(board_conn, "t_rb2") == "active_pr"
