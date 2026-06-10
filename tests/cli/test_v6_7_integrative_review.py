@@ -25,6 +25,8 @@ import pytest
 import hermes_cli.kanban_db as kb
 from hermes_cli.kanban_db import (
     _INTEGRATIVE_REVIEW_TITLE_PREFIX,
+    _v6_7_integrative_title_for,
+    _v6_7_integrative_title_pattern,
     _v6_7_parse_verdict,
     archive_task,
 )
@@ -86,12 +88,13 @@ def _seed_canonical_umbrella(conn) -> str:
     return "t_umb"
 
 
-def _latest_integrative_review(conn, tenant="marvel-swarm-v6-7-test"):
+def _latest_integrative_review(conn, umbrella_id="t_umb"):
+    pattern = _v6_7_integrative_title_pattern(umbrella_id)
     row = conn.execute(
         "SELECT id, status, title FROM tasks "
-        " WHERE title LIKE ? AND tenant = ? "
+        " WHERE title LIKE ? "
         " ORDER BY created_at DESC LIMIT 1",
-        (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%", tenant),
+        (pattern,),
     ).fetchone()
     return row
 
@@ -157,7 +160,7 @@ class TestSpawnTriggerConditions:
         # in a CLAIMABLE state, not stuck in todo because of a parent
         # link. The peer-task design ensures `ready` here.
         assert rev["status"] == "ready"
-        assert rev["title"] == _INTEGRATIVE_REVIEW_TITLE_PREFIX
+        assert rev["title"] == _v6_7_integrative_title_for("t_umb")
         # Verify the review was NOT linked as a child of the umbrella
         link = board_conn.execute(
             "SELECT 1 FROM task_links WHERE parent_id = 't_umb' AND child_id = ?",
@@ -253,7 +256,7 @@ class TestStateMachine:
         assert ok is False
         count = board_conn.execute(
             "SELECT COUNT(*) AS c FROM tasks WHERE title LIKE ?",
-            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%",),
+            (_v6_7_integrative_title_pattern("t_umb"),),
         ).fetchone()
         assert count["c"] == 1
 
@@ -290,11 +293,11 @@ class TestStateMachine:
         all_reviews = board_conn.execute(
             "SELECT id, title FROM tasks WHERE title LIKE ? "
             " ORDER BY created_at ASC",
-            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%",),
+            (_v6_7_integrative_title_pattern("t_umb"),),
         ).fetchall()
         assert len(all_reviews) == 2
-        assert all_reviews[0]["title"] == _INTEGRATIVE_REVIEW_TITLE_PREFIX
-        assert all_reviews[1]["title"] == f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}:r2"
+        assert all_reviews[0]["title"] == _v6_7_integrative_title_for("t_umb")
+        assert all_reviews[1]["title"] == _v6_7_integrative_title_for("t_umb", 2)
 
     def test_event_emitted_on_pending(self, board_conn) -> None:
         _seed_canonical_umbrella(board_conn)
@@ -433,3 +436,90 @@ class TestVerdictBypassClosed:
         board_conn.commit()
         ok = archive_task(board_conn, "t_umb")
         assert ok is True
+
+
+# =====================================================================
+# Self-review #7: same-tenant cross-umbrella isolation
+# =====================================================================
+
+
+class TestCrossUmbrellaIsolation:
+    def test_two_umbrellas_same_tenant_have_separate_reviews(
+        self, board_conn,
+    ) -> None:
+        """Two goal_mode umbrellas in the SAME tenant must each get
+        their own integrative review."""
+        _mk_task(board_conn, "t_umb_a", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_fr_a", assignee="friday", status="done")
+        _mk_task(board_conn, "t_tn_a", assignee="tony", status="done")
+        _link(board_conn, "t_umb_a", "t_fr_a")
+        _link(board_conn, "t_umb_a", "t_tn_a")
+        _mk_task(board_conn, "t_umb_b", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_fr_b", assignee="friday", status="done")
+        _mk_task(board_conn, "t_tn_b", assignee="tony", status="done")
+        _link(board_conn, "t_umb_b", "t_fr_b")
+        _link(board_conn, "t_umb_b", "t_tn_b")
+        board_conn.commit()
+        archive_task(board_conn, "t_umb_a")
+        archive_task(board_conn, "t_umb_b")
+        rev_a = _latest_integrative_review(board_conn, "t_umb_a")
+        rev_b = _latest_integrative_review(board_conn, "t_umb_b")
+        assert rev_a is not None
+        assert rev_b is not None
+        assert rev_a["id"] != rev_b["id"]
+        assert rev_a["title"] == _v6_7_integrative_title_for("t_umb_a")
+        assert rev_b["title"] == _v6_7_integrative_title_for("t_umb_b")
+
+    def test_approving_one_umbrella_does_not_unblock_another(
+        self, board_conn,
+    ) -> None:
+        """Umbrella A approves; B's archive must NOT find A's review."""
+        _mk_task(board_conn, "t_umb_a", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_fr_a", assignee="friday", status="done")
+        _mk_task(board_conn, "t_tn_a", assignee="tony", status="done")
+        _link(board_conn, "t_umb_a", "t_fr_a")
+        _link(board_conn, "t_umb_a", "t_tn_a")
+        _mk_task(board_conn, "t_umb_b", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_fr_b", assignee="friday", status="done")
+        _mk_task(board_conn, "t_tn_b", assignee="tony", status="done")
+        _link(board_conn, "t_umb_b", "t_fr_b")
+        _link(board_conn, "t_umb_b", "t_tn_b")
+        board_conn.commit()
+        archive_task(board_conn, "t_umb_a")
+        rev_a = _latest_integrative_review(board_conn, "t_umb_a")
+        board_conn.execute(
+            "UPDATE tasks SET status = 'done', result = 'verdict: approve' "
+            "WHERE id = ?", (rev_a["id"],),
+        )
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_umb_b")
+        assert ok is False
+        rev_b = _latest_integrative_review(board_conn, "t_umb_b")
+        assert rev_b is not None
+        assert rev_b["id"] != rev_a["id"]
+
+
+class TestFakeReviewMitigation:
+    def test_lookup_requires_created_by_dispatcher(self, board_conn) -> None:
+        """A worker hand-creating a fake review with `verdict: approve`
+        does NOT unblock the umbrella; lookup requires
+        `created_by='dispatcher'`."""
+        _seed_canonical_umbrella(board_conn)
+        fake_title = _v6_7_integrative_title_for("t_umb")
+        _mk_task(
+            board_conn, "t_fake_rev",
+            assignee="tchalla", status="done", title=fake_title,
+        )
+        board_conn.execute(
+            "UPDATE tasks SET created_by = 'hostile-worker', "
+            "  result = 'verdict: approve' WHERE id = 't_fake_rev'",
+        )
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_umb")
+        assert ok is False
+        real_rev = board_conn.execute(
+            "SELECT id FROM tasks WHERE created_by = 'dispatcher' "
+            " AND title = ?", (fake_title,),
+        ).fetchone()
+        assert real_rev is not None
+        assert real_rev["id"] != "t_fake_rev"

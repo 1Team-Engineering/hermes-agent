@@ -4543,6 +4543,20 @@ def decompose_triage_task(
 _INTEGRATIVE_REVIEW_TITLE_PREFIX = "Integrative architectural review (v6.7 #30)"
 _REVIEW_ASSIGNEE_ROLES = {"tony", "tchalla", "vision", "reviewer"}
 
+
+def _v6_7_integrative_title_for(umbrella_id: str, round_num: int = 1) -> str:
+    """Compose the canonical integrative-review title for an umbrella.
+    Embedding umbrella_id closes the same-tenant cross-umbrella
+    collision the second self-review flagged."""
+    suffix = f":r{round_num}" if round_num > 1 else ""
+    return f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX} for {umbrella_id}{suffix}"
+
+
+def _v6_7_integrative_title_pattern(umbrella_id: str) -> str:
+    """SQL LIKE pattern that matches every round of integrative review
+    for a specific umbrella."""
+    return f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX} for {umbrella_id}%"
+
 # Strict verdict parser. The verdict line must appear at the start of
 # a line (multiline mode) and the value must be exactly ``approve`` or
 # ``reject`` (followed by whitespace/punctuation/EOL — not by more
@@ -4583,28 +4597,16 @@ def _v6_7_find_existing_integrative_review(
     Subsequent re-spawn cycles append ``:rN`` to the title so multiple
     integrative reviews can coexist across remediation rounds.
     """
-    umbrella = conn.execute(
-        "SELECT tenant FROM tasks WHERE id = ?", (umbrella_id,),
+    # Match by per-umbrella title pattern. Tenant scoping alone wasn't
+    # enough — two umbrellas in the same tenant would collide. Now the
+    # title carries the umbrella id, so the LIKE pattern is unique.
+    pattern = _v6_7_integrative_title_pattern(umbrella_id)
+    row = conn.execute(
+        "SELECT id, status, result FROM tasks "
+        " WHERE title LIKE ? AND created_by = 'dispatcher' "
+        " ORDER BY created_at DESC LIMIT 1",
+        (pattern,),
     ).fetchone()
-    if umbrella is None:
-        return None
-    tenant = umbrella["tenant"]
-    # Match by title prefix to handle re-spawned reviews. Most recent
-    # first so a re-spawned review supersedes earlier rejected ones.
-    if tenant is None:
-        row = conn.execute(
-            "SELECT id, status, result FROM tasks "
-            " WHERE title LIKE ? AND tenant IS NULL "
-            " ORDER BY created_at DESC LIMIT 1",
-            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%",),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT id, status, result FROM tasks "
-            " WHERE title LIKE ? AND tenant = ? "
-            " ORDER BY created_at DESC LIMIT 1",
-            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%", tenant),
-        ).fetchone()
     if row is None:
         return None
     return (row["id"], row["status"], row["result"])
@@ -4613,27 +4615,15 @@ def _v6_7_find_existing_integrative_review(
 def _v6_7_count_integrative_reviews(
     conn: sqlite3.Connection, umbrella_id: str,
 ) -> int:
-    """Count integrative reviews spawned for this umbrella's tenant.
-    Used to compose the next re-spawn's title suffix (``:r2``, ``:r3``)
-    after a rejected verdict."""
-    umbrella = conn.execute(
-        "SELECT tenant FROM tasks WHERE id = ?", (umbrella_id,),
+    """Count integrative reviews spawned for this umbrella. Used to
+    compose the next re-spawn's title suffix (``:r2``, ``:r3``) after
+    a rejected verdict."""
+    pattern = _v6_7_integrative_title_pattern(umbrella_id)
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM tasks "
+        " WHERE title LIKE ? AND created_by = 'dispatcher'",
+        (pattern,),
     ).fetchone()
-    if umbrella is None:
-        return 0
-    tenant = umbrella["tenant"]
-    if tenant is None:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM tasks "
-            " WHERE title LIKE ? AND tenant IS NULL",
-            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%",),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM tasks "
-            " WHERE title LIKE ? AND tenant = ?",
-            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%", tenant),
-        ).fetchone()
     return int(row["c"]) if row else 0
 
 
@@ -4723,9 +4713,7 @@ def _v6_7_spawn_integrative_review(
         (umbrella_id,),
     ).fetchone()
     round_num = _v6_7_count_integrative_reviews(conn, umbrella_id) + 1
-    title = _INTEGRATIVE_REVIEW_TITLE_PREFIX
-    if round_num > 1:
-        title = f"{title}:r{round_num}"
+    title = _v6_7_integrative_title_for(umbrella_id, round_num)
     body = (
         f"## Integrative architectural review for {umbrella_id}\n\n"
         f"All per-block reviews are terminal. Before this umbrella "
