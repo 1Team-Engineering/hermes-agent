@@ -843,14 +843,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except (
+                    kanban_db.CompletionGateError,
+                    kanban_db.InvalidOptOutError,
+                ) as gate_err:
+                    # v6.7 gates rejected; surface as 409 so the dashboard
+                    # can show the user a structured retry hint.
+                    raise HTTPException(status_code=409, detail=str(gate_err)) from gate_err
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                try:
+                    ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                except kanban_db.FabricatedAuthClaimError as fab_err:
+                    raise HTTPException(status_code=409, detail=str(fab_err)) from fab_err
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -1186,14 +1197,27 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                            )
+                        except (
+                            kanban_db.CompletionGateError,
+                            kanban_db.InvalidOptOutError,
+                        ) as gate_err:
+                            entry.update(ok=False, error=str(gate_err))
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        try:
+                            ok = kanban_db.block_task(conn, tid)
+                        except kanban_db.FabricatedAuthClaimError as fab_err:
+                            entry.update(ok=False, error=str(fab_err))
+                            results.append(entry)
+                            continue
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):

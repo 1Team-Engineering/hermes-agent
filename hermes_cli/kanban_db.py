@@ -90,6 +90,13 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
+from hermes_cli.kanban_completion_gates import (
+    CompletionGateError,
+    verify_no_stray_artifacts,
+    verify_runtime_floor,
+    verify_workspace_diff,
+)
+
 _log = logging.getLogger(__name__)
 
 
@@ -3559,6 +3566,131 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+_V67_OPT_OUT_MIN_REASON_LEN = 20
+
+
+class InvalidOptOutError(ValueError):
+    """Raised when a v6.7 gate opt-out (``x_fast_justified`` /
+    ``x_no_code`` / ``x_stray_ok``) is set to a non-string or too-short
+    value.
+
+    Each opt-out is an explicit auditable bypass — it MUST be a string
+    of at least :data:`_V67_OPT_OUT_MIN_REASON_LEN` non-whitespace
+    characters explaining WHY the bypass is justified. Truthy booleans
+    or empty strings (``True``, ``"x"``, ``"ok"``) get rejected so the
+    opt-out is not a free keyword bypass for the gate. See review of
+    PR #11 in hermes-jarvis#61 thread.
+    """
+
+    def __init__(self, completing_task_id: str, key: str, value):
+        self.completing_task_id = completing_task_id
+        self.key = key
+        self.value = value
+        kind = type(value).__name__
+        super().__init__(
+            f"kanban_complete blocked: metadata.{key} must be a string of "
+            f"at least {_V67_OPT_OUT_MIN_REASON_LEN} non-whitespace characters "
+            f"explaining the bypass; got {kind} {value!r}. "
+            f"Either drop {key} and address the gate's finding, or pass "
+            f"a real justification like '{key}: trivially-one-line-rename "
+            f"verified by smoke test'."
+        )
+
+
+def _validate_opt_out(task_id: str, key: str, raw) -> Optional[str]:
+    """Return a normalized opt-out reason, or ``None`` when the key isn't
+    set. Raises :class:`InvalidOptOutError` when the value is truthy but
+    not a substantive string.
+    """
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, str) or len(raw.strip()) < _V67_OPT_OUT_MIN_REASON_LEN:
+        raise InvalidOptOutError(task_id, key, raw)
+    return raw.strip()
+
+
+def _v6_7_run_completion_gates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    metadata: Optional[dict],
+    now: int,
+) -> list:
+    """Run the v6.7 Tranche 1 completion gates and return any violations.
+
+    Reads task assignee / workspace / started_at from the tasks row and
+    delegates to the pure gate functions in ``kanban_completion_gates``.
+    Returns an empty list when all gates pass.
+
+    Workers may opt out of individual gates via per-call metadata keys.
+    Each opt-out value MUST be a non-empty string of at least
+    :data:`_V67_OPT_OUT_MIN_REASON_LEN` chars explaining the bypass
+    (truthy bools or short strings are rejected with
+    :class:`InvalidOptOutError`). Opt-outs that ARE accepted get
+    emitted as a ``completion_opt_out_used`` event so the bypass is
+    auditable downstream.
+
+    Opt-out keys (string only):
+        - ``x_fast_justified`` — skip runtime-floor (#64)
+        - ``x_no_code`` — skip workspace-diff (#62)
+        - ``x_stray_ok`` — skip repo-hygiene (#28)
+    """
+    row = conn.execute(
+        "SELECT assignee, workspace_kind, workspace_path, started_at "
+        "  FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return []
+    md = metadata or {}
+    fast_ok_reason = _validate_opt_out(task_id, "x_fast_justified", md.get("x_fast_justified"))
+    no_code_reason = _validate_opt_out(task_id, "x_no_code", md.get("x_no_code"))
+    stray_ok_reason = _validate_opt_out(task_id, "x_stray_ok", md.get("x_stray_ok"))
+    accepted_opt_outs = {
+        k: v for k, v in (
+            ("x_fast_justified", fast_ok_reason),
+            ("x_no_code", no_code_reason),
+            ("x_stray_ok", stray_ok_reason),
+        ) if v is not None
+    }
+    if accepted_opt_outs:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_opt_out_used",
+                {"opt_outs": accepted_opt_outs},
+            )
+    fast_ok = fast_ok_reason is not None
+    no_code = no_code_reason is not None
+    stray_ok = stray_ok_reason is not None
+    violations: list = []
+    floor = verify_runtime_floor(
+        assignee=row["assignee"],
+        started_at=row["started_at"],
+        completed_at=now,
+        allow_below_floor=fast_ok,
+    )
+    if floor is not None:
+        violations.append(floor)
+    diff = verify_workspace_diff(
+        assignee=row["assignee"],
+        workspace_kind=row["workspace_kind"],
+        workspace_path=row["workspace_path"],
+        summary=summary,
+        allow_no_code=no_code,
+    )
+    if diff is not None:
+        violations.append(diff)
+    stray = verify_no_stray_artifacts(
+        workspace_kind=row["workspace_kind"],
+        workspace_path=row["workspace_path"],
+        allow_stray=stray_ok,
+    )
+    if stray is not None:
+        violations.append(stray)
+    return violations
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3625,6 +3757,30 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # v6.7 Tranche 1: kanban_complete verification gates.
+    # See hermes-jarvis#61, #62, #28, #64. Same pre-write-txn pattern as
+    # _verify_created_cards: any violation raises before state changes, so
+    # the worker can retry after fixing the underlying issue.
+    _violations = _v6_7_run_completion_gates(
+        conn, task_id, summary=summary, metadata=metadata, now=now,
+    )
+    if _violations:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_v6_7_gates",
+                {
+                    "violations": [
+                        {"kind": type(v).__name__, "message": v.message()}
+                        for v in _violations
+                    ],
+                    "summary_preview": (
+                        (summary or result or "").strip().splitlines()[0][:200]
+                        if (summary or result) else None
+                    ),
+                },
+            )
+        raise CompletionGateError(_violations, task_id)
 
     with write_txn(conn):
         if expected_run_id is None:
