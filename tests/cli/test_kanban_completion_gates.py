@@ -17,11 +17,15 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.kanban_completion_gates import (
+    DocDriftViolation,
     MissingReviewerFieldViolation,
+    PhantomPRViolation,
     RuntimeFloorViolation,
     StrayArtifactViolation,
     WorkspaceDiffViolation,
+    verify_doc_drift,
     verify_no_stray_artifacts,
+    verify_pr_urls_exist,
     verify_reviewer_fields,
     verify_runtime_floor,
     verify_workspace_diff,
@@ -1110,3 +1114,225 @@ adversarial_pass:
             result=verdict,
         )
         assert v is None
+
+
+# =====================================================================
+# verify_pr_urls_exist — #63
+# =====================================================================
+
+
+def _gh_pr_real(url: str):
+    """Stub: every URL exists."""
+    return True
+
+
+def _gh_pr_phantom(url: str):
+    """Stub: every URL is 404."""
+    return False
+
+
+def _gh_pr_indeterminate(url: str):
+    """Stub: gh not installed / network error."""
+    return None
+
+
+def _gh_pr_only_42_real(url: str):
+    """Stub: only PR #42 exists; others are phantom."""
+    if "/pull/42" in url:
+        return True
+    return False
+
+
+class TestPRExistence:
+    def test_no_pr_url_in_text_skips(self) -> None:
+        assert verify_pr_urls_exist(
+            result="verdict: approve\ntest_quality: ...",
+            summary="reviewed",
+        ) is None
+
+    def test_real_pr_passes(self) -> None:
+        assert verify_pr_urls_exist(
+            result="Approved at https://github.com/o/r/pull/1",
+            summary=None,
+            gh_pr_exists=_gh_pr_real,
+        ) is None
+
+    def test_phantom_pr_rejected(self) -> None:
+        """The 2026-06-09 Tchalla case: 'cannot run gh pr diff 42'
+        with PR #42 not existing on the remote."""
+        v = verify_pr_urls_exist(
+            result="Approved at https://github.com/1Team-Engineering/hermes-agent/pull/42",
+            summary=None,
+            gh_pr_exists=_gh_pr_phantom,
+        )
+        assert isinstance(v, PhantomPRViolation)
+        assert "pull/42" in v.phantom_urls[0]
+
+    def test_mixed_real_and_phantom(self) -> None:
+        v = verify_pr_urls_exist(
+            result=(
+                "Approved against https://github.com/o/r/pull/42 (real) and "
+                "also against https://github.com/o/r/pull/99 (phantom)"
+            ),
+            summary=None,
+            gh_pr_exists=_gh_pr_only_42_real,
+        )
+        assert v is not None
+        assert any("pull/99" in u for u in v.phantom_urls)
+        assert not any("pull/42" in u for u in v.phantom_urls)
+
+    def test_indeterminate_falls_open(self) -> None:
+        """When gh is missing or auth is broken, the gate doesn't reject
+        — workers can still complete in offline / broken-gh envs."""
+        assert verify_pr_urls_exist(
+            result="See https://github.com/o/r/pull/42",
+            summary=None,
+            gh_pr_exists=_gh_pr_indeterminate,
+        ) is None
+
+    def test_summary_text_also_scanned(self) -> None:
+        v = verify_pr_urls_exist(
+            result="approve",
+            summary="Closing the loop at https://github.com/o/r/pull/99",
+            gh_pr_exists=_gh_pr_phantom,
+        )
+        assert v is not None
+
+    def test_dedup_same_url_twice(self) -> None:
+        v = verify_pr_urls_exist(
+            result=(
+                "first mention https://github.com/o/r/pull/9 "
+                "second mention https://github.com/o/r/pull/9"
+            ),
+            summary=None,
+            gh_pr_exists=_gh_pr_phantom,
+        )
+        assert v is not None
+        assert len(v.phantom_urls) == 1
+
+    def test_allow_phantom_pr_opt_out(self) -> None:
+        assert verify_pr_urls_exist(
+            result="https://github.com/o/r/pull/42",
+            summary=None,
+            gh_pr_exists=_gh_pr_phantom,
+            allow_phantom_pr=True,
+        ) is None
+
+
+# =====================================================================
+# verify_doc_drift — #32
+# =====================================================================
+
+
+def _make_repo_with_doc(tmp_path: Path, filename: str, content: str) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / filename).write_text(content)
+    return tmp_path
+
+
+class TestDocDrift:
+    def test_non_versioned_tenant_skips(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(tmp_path, "README.md", "# Project v5.0 docs\n")
+        assert verify_doc_drift(
+            tenant="hermes-self-improvement",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_no_readme_skips(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(tmp_path, "src.py", "print('hi')\n")
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_stale_version_in_readme_rejected(self, tmp_path: Path) -> None:
+        """The exact 2026-06-09 agent-dashboard PR #1 case: README still
+        said 'v6.2 Marvel swarm test target' while the chain was v6.6."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Hermes Operator Dashboard\n\n"
+            "v6.2 Marvel swarm test target with 8 metric views.\n",
+        )
+        v = verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        assert isinstance(v, DocDriftViolation)
+        assert v.active_version == "v6.6"
+
+    def test_current_version_in_readme_passes(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project\n\n"
+            "Current target: v6.6 Marvel swarm chain.\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_history_section_excused(self, tmp_path: Path) -> None:
+        """Mentions of older versions in a # History or # Older
+        versions section don't count — they're historical context."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\n"
+            "Current target is the v6.6 chain.\n\n"
+            "## Previous versions\n\n"
+            "- v6.2 was the original swarm test target\n"
+            "- v6.5 added the dispatcher heartbeat\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_changelog_section_excused(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(
+            tmp_path, "CHANGELOG.md",
+            "# Changelog\n\n"
+            "## v6.6\n- new gates\n\n"
+            "## v6.2\n- original release\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_higher_version_in_doc_is_not_stale(self, tmp_path: Path) -> None:
+        """A future v6.7 mention in a v6.6 chain isn't 'stale' — only
+        OLDER mentions trip the gate."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\nLooking ahead to v6.7\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_scratch_workspace_skipped(self) -> None:
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="scratch",
+            workspace_path=None,
+        ) is None
+
+    def test_allow_doc_drift_opt_out(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.2)\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            allow_doc_drift=True,
+        ) is None

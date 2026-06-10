@@ -723,6 +723,231 @@ def verify_reviewer_fields(
 
 
 # =====================================================================
+# PR-existence gate (#63)
+# =====================================================================
+
+# GitHub PR URLs in verdict text or summary. Captures org, repo, and
+# pull number for `gh pr view <url>` verification.
+_GITHUB_PR_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/"
+    r"(?P<org>[\w-]+)/(?P<repo>[\w.-]+)/pull/(?P<num>\d+)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PhantomPRViolation:
+    phantom_urls: tuple[str, ...]
+
+    def message(self) -> str:
+        listing = "\n  - ".join(self.phantom_urls)
+        return (
+            f"pr-existence: the verdict references GitHub PR URLs that "
+            f"don't resolve via `gh pr view`:\n  - {listing}\n"
+            f"Either remove the phantom URL from the verdict, or open the "
+            f"PR first (gh pr create) and then re-call kanban_complete. "
+            f"This catches the 2026-06-09 Tchalla case where a release-"
+            f"gate reviewer 'approved' PR #42 that didn't exist."
+        )
+
+
+def _extract_pr_urls(text: str) -> list[str]:
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for m in _GITHUB_PR_URL_RE.finditer(text):
+        url = m.group(0)
+        seen.setdefault(url, None)
+    return list(seen.keys())
+
+
+def _gh_pr_exists(url: str) -> Optional[bool]:
+    """Return True if the URL resolves via `gh pr view`, False if it
+    explicitly doesn't exist, None on indeterminate (gh missing /
+    network error / unauthenticated). Indeterminate falls open (the
+    gate doesn't reject) so transient gh problems don't trap workers."""
+    import shutil
+    if not shutil.which("gh"):
+        return None
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", url, "--json", "number"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if out.returncode == 0:
+        return True
+    # Distinguish "not found" from auth/network errors: stderr usually
+    # mentions "Not Found" / "GraphQL: Could not resolve" on 404. Other
+    # failures (auth, network) we treat as indeterminate.
+    stderr = (out.stderr or "").lower()
+    if "not found" in stderr or "could not resolve" in stderr or "no pull request" in stderr:
+        return False
+    return None
+
+
+def verify_pr_urls_exist(
+    result: Optional[str],
+    summary: Optional[str],
+    *,
+    allow_phantom_pr: bool = False,
+    gh_pr_exists: callable = _gh_pr_exists,
+) -> Optional[PhantomPRViolation]:
+    """Reject completions whose verdict/summary references PR URLs
+    that don't exist.
+
+    Skipped (returns None) when:
+    - no GitHub PR URLs found in either text
+    - every URL resolves to True or indeterminate (None)
+    - caller opted out via ``allow_phantom_pr=True``
+
+    Indeterminate URLs (gh missing / network error / unauthenticated)
+    fall open — workers can still complete when gh is broken.
+    """
+    if allow_phantom_pr:
+        return None
+    urls = _extract_pr_urls((result or "") + "\n" + (summary or ""))
+    if not urls:
+        return None
+    phantom = []
+    for url in urls:
+        verdict = gh_pr_exists(url)
+        if verdict is False:
+            phantom.append(url)
+    if not phantom:
+        return None
+    return PhantomPRViolation(phantom_urls=tuple(phantom))
+
+
+# =====================================================================
+# Doc-drift gate (#32)
+# =====================================================================
+
+# Tenant slugs encode a version in the shape ``marvel-swarm-vN-N-test``
+# (or similar). The gate only fires for tasks whose tenant matches —
+# generic tenants (e.g. ``hermes-self-improvement``) are unaffected.
+_VERSIONED_TENANT_RE = re.compile(
+    r"(?P<chain>[a-z]+(?:-[a-z]+)+)-v(?P<major>\d+)-(?P<minor>\d+)(?:-[a-z]+)*",
+    re.IGNORECASE,
+)
+
+# Files in the workspace to scan for stale version stamps. README and
+# CHANGELOG are the canonical drift surfaces; we deliberately don't
+# walk the whole tree (too noisy + slow).
+_DOC_DRIFT_FILES = ("README.md", "README", "CHANGELOG.md", "CHANGELOG")
+
+
+@dataclass(frozen=True)
+class DocDriftViolation:
+    active_version: str
+    stale_refs: tuple[tuple[str, str], ...]  # (filename, version_text)
+
+    def message(self) -> str:
+        listing = "\n  - ".join(
+            f"{fn}: mentions {v} (active is {self.active_version})"
+            for fn, v in self.stale_refs
+        )
+        return (
+            f"doc-drift: the workspace's README/CHANGELOG mentions versions "
+            f"older than the active chain version ({self.active_version}) "
+            f"outside a history/changelog section:\n  - {listing}\n"
+            f"Update the doc to reference the current version, or move "
+            f"the older mention into a history section (a heading like "
+            f"## Previous versions / ## Older versions / a CHANGELOG "
+            f"entry under the older heading)."
+        )
+
+
+def _parse_active_version(tenant: str) -> Optional[tuple[int, int]]:
+    if not tenant:
+        return None
+    m = _VERSIONED_TENANT_RE.match(tenant)
+    if not m:
+        return None
+    return (int(m.group("major")), int(m.group("minor")))
+
+
+def _scan_doc_for_stale(
+    path: str, active: tuple[int, int],
+) -> list[str]:
+    """Return list of stale version strings found in ``path`` outside
+    a history/older-versions heading. Empty list = no drift."""
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except (OSError, IOError):
+        return []
+    # Heuristic for history sections: any heading containing "history",
+    # "older", "previous", "changelog" puts subsequent content in
+    # historical context.
+    in_history = False
+    stale: list[str] = []
+    version_re = re.compile(r"\bv(\d+)[\.\-](\d+)\b", re.IGNORECASE)
+    history_heading_re = re.compile(
+        r"^#+\s*.*(?:history|older|previous|changelog|archive)",
+        re.IGNORECASE,
+    )
+    for line in text.splitlines():
+        if line.startswith("#"):
+            in_history = bool(history_heading_re.match(line))
+        if in_history:
+            continue
+        for m in version_re.finditer(line):
+            v_major, v_minor = int(m.group(1)), int(m.group(2))
+            if (v_major, v_minor) < active:
+                stale.append(m.group(0))
+    return stale
+
+
+def verify_doc_drift(
+    tenant: Optional[str],
+    workspace_kind: Optional[str],
+    workspace_path: Optional[str],
+    *,
+    allow_doc_drift: bool = False,
+) -> Optional[DocDriftViolation]:
+    """Reject completions where README/CHANGELOG mention versions older
+    than the active chain version outside a history section.
+
+    Skipped (returns None) when:
+    - tenant doesn't encode a version (e.g. plain ``hermes-self-improvement``)
+    - workspace is scratch or path doesn't exist
+    - none of the canonical doc files exist in the workspace
+    - all stale mentions are inside history headings
+    - caller opted out via ``allow_doc_drift=True``
+    """
+    if allow_doc_drift:
+        return None
+    if not tenant or not workspace_path:
+        return None
+    if (workspace_kind or "scratch") not in {"dir", "worktree"}:
+        return None
+    if not os.path.isdir(workspace_path):
+        return None
+    active = _parse_active_version(tenant)
+    if active is None:
+        return None
+    active_str = f"v{active[0]}.{active[1]}"
+    stale: list[tuple[str, str]] = []
+    for fn in _DOC_DRIFT_FILES:
+        path = os.path.join(workspace_path, fn)
+        if not os.path.isfile(path):
+            continue
+        # CHANGELOG files are historical by nature — older versions
+        # there are expected, not stale. Only scan READMEs.
+        if "changelog" in fn.lower():
+            continue
+        for v in _scan_doc_for_stale(path, active):
+            stale.append((fn, v))
+    if not stale:
+        return None
+    return DocDriftViolation(
+        active_version=active_str,
+        stale_refs=tuple(stale),
+    )
+
+
+# =====================================================================
 # Exception class for the integration in `complete_task`
 # =====================================================================
 
