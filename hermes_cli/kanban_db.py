@@ -4540,7 +4540,178 @@ def decompose_triage_task(
     return child_ids
 
 
+_INTEGRATIVE_REVIEW_TITLE = "Integrative architectural review (v6.7 #30)"
+_REVIEW_ASSIGNEE_ROLES = {"tony", "tchalla", "vision", "reviewer"}
+
+
+@dataclass(frozen=True)
+class IntegrativeReviewSpawned:
+    """Returned when ``archive_task`` blocks because a v6.7 integrative
+    review was just spawned. Carries the new review's id so callers
+    can surface it to the user / orchestrator. The umbrella task is
+    NOT archived; the caller retries ``archive_task`` after the new
+    review reaches a terminal state with ``verdict: approve``."""
+    umbrella_id: str
+    review_id: str
+
+
+def _v6_7_find_existing_integrative_review(
+    conn: sqlite3.Connection, umbrella_id: str,
+) -> Optional[tuple[str, str, Optional[str]]]:
+    """Return ``(review_id, status, result)`` of any existing
+    integrative-review child task for this umbrella, or None."""
+    row = conn.execute(
+        "SELECT t.id, t.status, t.result "
+        "  FROM tasks t JOIN task_links l ON l.child_id = t.id "
+        " WHERE l.parent_id = ? AND t.title = ?",
+        (umbrella_id, _INTEGRATIVE_REVIEW_TITLE),
+    ).fetchone()
+    if row is None:
+        return None
+    return (row["id"], row["status"], row["result"])
+
+
+def _v6_7_should_spawn_integrative_review(
+    conn: sqlite3.Connection, umbrella_id: str,
+) -> bool:
+    """True if the umbrella looks like a JARVIS goal-mode chain whose
+    per-block children are all terminal and there's no
+    integrative-review child yet. Conservative — only fires when ALL of:
+
+    1. Umbrella is ``goal_mode=True`` (JARVIS-style keep_running chain)
+    2. Has at least one child via task_links
+    3. Every non-review child is in {done, archived, blocked} terminal
+    4. At least one review-role child exists (we don't spawn an
+       integrative review for chains that had no per-block reviews)
+    5. No existing integrative-review child task
+
+    These constraints mean a user manually archiving a one-off task
+    won't accidentally trigger the gate.
+    """
+    row = conn.execute(
+        "SELECT goal_mode FROM tasks WHERE id = ?", (umbrella_id,),
+    ).fetchone()
+    if row is None or not row["goal_mode"]:
+        return False
+    children = conn.execute(
+        "SELECT t.id, t.status, t.assignee "
+        "  FROM tasks t JOIN task_links l ON l.child_id = t.id "
+        " WHERE l.parent_id = ?",
+        (umbrella_id,),
+    ).fetchall()
+    if not children:
+        return False
+    terminal_statuses = {"done", "archived", "blocked"}
+    has_review_child = False
+    for ch in children:
+        assignee = (ch["assignee"] or "").lower()
+        if assignee in _REVIEW_ASSIGNEE_ROLES:
+            has_review_child = True
+            continue  # review children's terminal state doesn't matter here
+        if ch["status"] not in terminal_statuses:
+            return False
+    if not has_review_child:
+        return False
+    return _v6_7_find_existing_integrative_review(conn, umbrella_id) is None
+
+
+def _v6_7_spawn_integrative_review(
+    conn: sqlite3.Connection, umbrella_id: str,
+) -> str:
+    """Create the integrative architectural review task as a child of
+    the umbrella. Returns the new task's id."""
+    umbrella = conn.execute(
+        "SELECT tenant, workspace_kind, workspace_path, branch_name "
+        "  FROM tasks WHERE id = ?",
+        (umbrella_id,),
+    ).fetchone()
+    body = (
+        f"## Integrative architectural review (v6.7 #30)\n\n"
+        f"All per-block reviews for umbrella {umbrella_id} are terminal. "
+        f"Before this umbrella can be archived, run ONE final integrative "
+        f"pass that no per-block reviewer could do.\n\n"
+        f"### Scope (must address each)\n\n"
+        f"1. **End-to-end request trace**: hit one public entrypoint and "
+        f"follow it through every layer. Count DB round-trips, identify "
+        f"caches, note any layer that opens the same connection more than "
+        f"once.\n"
+        f"2. **End-to-end page render trace**: hit one user-facing page and "
+        f"trace layout + leaf execution. Look for redundant server work, "
+        f"abs-path leaks, and any state pulled at request time that could "
+        f"leak across users.\n"
+        f"3. **Adversarial enumeration**: list every env var, request "
+        f"input, file path, and external IO surface the deliverable "
+        f"touches. For each, name the bound enforced.\n"
+        f"4. **Error-path audit**: deliberately break one of: DB read, "
+        f"upstream API, environment variable. Follow the error to the "
+        f"user. Does it leak server-side info? Does the dispatcher "
+        f"swallow it? Does the user see a stack trace?\n\n"
+        f"Verdict format (v6.7 #29/#31): `verdict: approve | reject` "
+        f"plus `test_quality:` (imports_match + evidence) plus "
+        f"`adversarial_pass:` block. See profile SOUL for the full shape."
+    )
+    workspace_kind = (umbrella["workspace_kind"] or "scratch")
+    workspace_path = umbrella["workspace_path"]
+    # If umbrella uses a worktree, the review uses the same dir so
+    # tchalla can run `gh pr diff` and exercise `npm test` etc. against
+    # the actual deliverable.
+    review_workspace_kind = (
+        "dir" if workspace_kind in {"dir", "worktree"} else "scratch"
+    )
+    review_workspace_path = (
+        workspace_path if workspace_kind in {"dir", "worktree"} else None
+    )
+    return create_task(
+        conn,
+        title=_INTEGRATIVE_REVIEW_TITLE,
+        body=body,
+        assignee="tchalla",
+        created_by="dispatcher",
+        workspace_kind=review_workspace_kind,
+        workspace_path=review_workspace_path,
+        tenant=umbrella["tenant"],
+        parents=[umbrella_id],
+        idempotency_key=f"v6.7-integrative-review:{umbrella_id}",
+        initial_status="running",  # auto-ready since umbrella is the parent
+    )
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    # v6.7 #30 — block JARVIS-umbrella archives until the integrative
+    # architectural review is approved. Other tasks (or umbrellas
+    # without per-block reviews) archive normally. See
+    # hermes-jarvis#61 for the bootstrap-paradox case study.
+    if _v6_7_should_spawn_integrative_review(conn, task_id):
+        review_id = _v6_7_spawn_integrative_review(conn, task_id)
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "archive_blocked_pending_integrative_review",
+                {"review_id": review_id},
+            )
+        return False
+    existing = _v6_7_find_existing_integrative_review(conn, task_id)
+    if existing is not None:
+        review_id, status, result = existing
+        if status not in {"done", "archived"}:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "archive_blocked_pending_integrative_review",
+                    {"review_id": review_id, "review_status": status},
+                )
+            return False
+        # Done — verdict must approve. A rejecting verdict still blocks
+        # archive; the umbrella needs to remediate then re-spawn the
+        # review.
+        verdict_ok = bool(result) and "verdict: approve" in result.lower()
+        if not verdict_ok:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "archive_blocked_integrative_review_rejected",
+                    {"review_id": review_id, "result_preview":
+                     (result or "")[:200]},
+                )
+            return False
+
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
