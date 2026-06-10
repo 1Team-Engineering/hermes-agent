@@ -92,7 +92,9 @@ from toolsets import get_toolset_names
 
 from hermes_cli.kanban_completion_gates import (
     CompletionGateError,
+    verify_doc_drift,
     verify_no_stray_artifacts,
+    verify_pr_urls_exist,
     verify_reviewer_fields,
     verify_runtime_floor,
     verify_workspace_diff,
@@ -3641,7 +3643,7 @@ def _v6_7_run_completion_gates(
         - ``x_no_reviewer_fields`` — skip reviewer-fields (#29, #31)
     """
     row = conn.execute(
-        "SELECT assignee, body, workspace_kind, workspace_path, started_at "
+        "SELECT assignee, body, tenant, workspace_kind, workspace_path, started_at "
         "  FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -3652,12 +3654,16 @@ def _v6_7_run_completion_gates(
     no_code_reason = _validate_opt_out(task_id, "x_no_code", md.get("x_no_code"))
     stray_ok_reason = _validate_opt_out(task_id, "x_stray_ok", md.get("x_stray_ok"))
     no_rf_reason = _validate_opt_out(task_id, "x_no_reviewer_fields", md.get("x_no_reviewer_fields"))
+    phantom_ok_reason = _validate_opt_out(task_id, "x_phantom_pr_ok", md.get("x_phantom_pr_ok"))
+    doc_drift_reason = _validate_opt_out(task_id, "x_doc_drift_ok", md.get("x_doc_drift_ok"))
     accepted_opt_outs = {
         k: v for k, v in (
             ("x_fast_justified", fast_ok_reason),
             ("x_no_code", no_code_reason),
             ("x_stray_ok", stray_ok_reason),
             ("x_no_reviewer_fields", no_rf_reason),
+            ("x_phantom_pr_ok", phantom_ok_reason),
+            ("x_doc_drift_ok", doc_drift_reason),
         ) if v is not None
     }
     if accepted_opt_outs:
@@ -3670,6 +3676,8 @@ def _v6_7_run_completion_gates(
     no_code = no_code_reason is not None
     stray_ok = stray_ok_reason is not None
     no_reviewer_fields = no_rf_reason is not None
+    phantom_ok = phantom_ok_reason is not None
+    doc_drift_ok = doc_drift_reason is not None
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
@@ -3703,6 +3711,21 @@ def _v6_7_run_completion_gates(
     )
     if reviewer is not None:
         violations.append(reviewer)
+    pr_phantom = verify_pr_urls_exist(
+        result=result,
+        summary=summary,
+        allow_phantom_pr=phantom_ok,
+    )
+    if pr_phantom is not None:
+        violations.append(pr_phantom)
+    drift = verify_doc_drift(
+        tenant=row["tenant"],
+        workspace_kind=row["workspace_kind"],
+        workspace_path=row["workspace_path"],
+        allow_doc_drift=doc_drift_ok,
+    )
+    if drift is not None:
+        violations.append(drift)
     return violations
 
 

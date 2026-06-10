@@ -17,11 +17,15 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.kanban_completion_gates import (
+    DocDriftViolation,
     MissingReviewerFieldViolation,
+    PhantomPRViolation,
     RuntimeFloorViolation,
     StrayArtifactViolation,
     WorkspaceDiffViolation,
+    verify_doc_drift,
     verify_no_stray_artifacts,
+    verify_pr_urls_exist,
     verify_reviewer_fields,
     verify_runtime_floor,
     verify_workspace_diff,
@@ -1110,3 +1114,343 @@ adversarial_pass:
             result=verdict,
         )
         assert v is None
+
+
+# =====================================================================
+# verify_pr_urls_exist — #63
+# =====================================================================
+
+
+def _gh_pr_real(url: str):
+    """Stub: every URL exists."""
+    return True
+
+
+def _gh_pr_phantom(url: str):
+    """Stub: every URL is 404."""
+    return False
+
+
+def _gh_pr_indeterminate(url: str):
+    """Stub: gh not installed / network error."""
+    return None
+
+
+def _gh_pr_only_42_real(url: str):
+    """Stub: only PR #42 exists; others are phantom."""
+    if "/pull/42" in url:
+        return True
+    return False
+
+
+class TestPRExistence:
+    def test_no_pr_url_in_text_skips(self) -> None:
+        assert verify_pr_urls_exist(
+            result="verdict: approve\ntest_quality: ...",
+            summary="reviewed",
+        ) is None
+
+    def test_real_pr_passes(self) -> None:
+        assert verify_pr_urls_exist(
+            result="Approved at https://github.com/o/r/pull/1",
+            summary=None,
+            gh_pr_exists=_gh_pr_real,
+        ) is None
+
+    def test_phantom_pr_rejected(self) -> None:
+        """The 2026-06-09 Tchalla case: 'cannot run gh pr diff 42'
+        with PR #42 not existing on the remote."""
+        v = verify_pr_urls_exist(
+            result="Approved at https://github.com/1Team-Engineering/hermes-agent/pull/42",
+            summary=None,
+            gh_pr_exists=_gh_pr_phantom,
+        )
+        assert isinstance(v, PhantomPRViolation)
+        assert "pull/42" in v.phantom_urls[0]
+
+    def test_mixed_real_and_phantom(self) -> None:
+        v = verify_pr_urls_exist(
+            result=(
+                "Approved against https://github.com/o/r/pull/42 (real) and "
+                "also against https://github.com/o/r/pull/99 (phantom)"
+            ),
+            summary=None,
+            gh_pr_exists=_gh_pr_only_42_real,
+        )
+        assert v is not None
+        assert any("pull/99" in u for u in v.phantom_urls)
+        assert not any("pull/42" in u for u in v.phantom_urls)
+
+    def test_indeterminate_falls_open(self) -> None:
+        """When gh is missing or auth is broken, the gate doesn't reject
+        — workers can still complete in offline / broken-gh envs."""
+        assert verify_pr_urls_exist(
+            result="See https://github.com/o/r/pull/42",
+            summary=None,
+            gh_pr_exists=_gh_pr_indeterminate,
+        ) is None
+
+    def test_summary_text_also_scanned(self) -> None:
+        v = verify_pr_urls_exist(
+            result="approve",
+            summary="Closing the loop at https://github.com/o/r/pull/99",
+            gh_pr_exists=_gh_pr_phantom,
+        )
+        assert v is not None
+
+    def test_dedup_same_url_twice(self) -> None:
+        v = verify_pr_urls_exist(
+            result=(
+                "first mention https://github.com/o/r/pull/9 "
+                "second mention https://github.com/o/r/pull/9"
+            ),
+            summary=None,
+            gh_pr_exists=_gh_pr_phantom,
+        )
+        assert v is not None
+        assert len(v.phantom_urls) == 1
+
+    def test_allow_phantom_pr_opt_out(self) -> None:
+        assert verify_pr_urls_exist(
+            result="https://github.com/o/r/pull/42",
+            summary=None,
+            gh_pr_exists=_gh_pr_phantom,
+            allow_phantom_pr=True,
+        ) is None
+
+
+# =====================================================================
+# verify_doc_drift — #32
+# =====================================================================
+
+
+def _make_repo_with_doc(tmp_path: Path, filename: str, content: str) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / filename).write_text(content)
+    return tmp_path
+
+
+class TestDocDrift:
+    def test_non_versioned_tenant_skips(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(tmp_path, "README.md", "# Project v5.0 docs\n")
+        assert verify_doc_drift(
+            tenant="hermes-self-improvement",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_no_readme_skips(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(tmp_path, "src.py", "print('hi')\n")
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_stale_version_in_readme_rejected(self, tmp_path: Path) -> None:
+        """The exact 2026-06-09 agent-dashboard PR #1 case: README still
+        said 'v6.2 Marvel swarm test target' while the chain was v6.6."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Hermes Operator Dashboard\n\n"
+            "v6.2 Marvel swarm test target with 8 metric views.\n",
+        )
+        v = verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        assert isinstance(v, DocDriftViolation)
+        assert v.active_version == "v6.6"
+
+    def test_current_version_in_readme_passes(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project\n\n"
+            "Current target: v6.6 Marvel swarm chain.\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_history_section_excused(self, tmp_path: Path) -> None:
+        """Mentions of older versions in a # History or # Older
+        versions section don't count — they're historical context."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\n"
+            "Current target is the v6.6 chain.\n\n"
+            "## Previous versions\n\n"
+            "- v6.2 was the original swarm test target\n"
+            "- v6.5 added the dispatcher heartbeat\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_changelog_section_excused(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(
+            tmp_path, "CHANGELOG.md",
+            "# Changelog\n\n"
+            "## v6.6\n- new gates\n\n"
+            "## v6.2\n- original release\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_higher_version_in_doc_is_not_stale(self, tmp_path: Path) -> None:
+        """A future v6.7 mention in a v6.6 chain isn't 'stale' — only
+        OLDER mentions trip the gate."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\nLooking ahead to v6.7\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_scratch_workspace_skipped(self) -> None:
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="scratch",
+            workspace_path=None,
+        ) is None
+
+    def test_allow_doc_drift_opt_out(self, tmp_path: Path) -> None:
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.2)\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            allow_doc_drift=True,
+        ) is None
+
+    # === self-review fixes ===
+
+    def test_nested_history_heading_does_not_exit_history(
+        self, tmp_path: Path,
+    ) -> None:
+        """Self-review #5: a `### v6.2 details` subsection under
+        `## History` used to exit history mode (the new heading reset
+        in_history to False). Now depth-aware: subsection only exits
+        history when level <= history_depth AND it's not itself a
+        history heading."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\n"
+            "Current target: v6.6\n\n"
+            "## History\n\n"
+            "### v6.2 details\n\n"
+            "We did v6.2 things here.\n\n"
+            "### v6.5 details\n\n"
+            "Added the dispatcher heartbeat.\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_nonhistory_heading_at_history_level_exits_history(
+        self, tmp_path: Path,
+    ) -> None:
+        """The complement of the previous test: a sibling heading at
+        the same level (here `## Roadmap`) DOES exit the history
+        section, so a stale v6.2 there gets flagged."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\n"
+            "## History\n\n"
+            "- v6.2 was the first cut.\n\n"
+            "## Roadmap\n\n"
+            "Considering features carried over from v6.2.\n",
+        )
+        v = verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        assert v is not None
+        # The v6.2 inside ## History is excused; only the one under
+        # ## Roadmap should count.
+        assert v.stale_refs == (("README.md", "v6.2"),)
+
+
+class TestPRExistenceErrorClassification:
+    """Self-review #2: the substring matcher for `_gh_pr_exists`
+    confused DNS / network errors with 404. Now those fall open as
+    indeterminate, not phantom."""
+
+    def _make_run(self, returncode: int, stderr: str):
+        class _R:
+            def __init__(self, rc, se):
+                self.returncode = rc
+                self.stdout = ""
+                self.stderr = se
+        return _R(returncode, stderr)
+
+    def test_dns_error_falls_open(self, monkeypatch) -> None:
+        """`could not resolve host: api.github.com` no longer counts
+        as a 404."""
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "could not resolve host: api.github.com"
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/1") is None
+
+    def test_tls_error_falls_open(self, monkeypatch) -> None:
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "tls handshake error: connection reset"
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/1") is None
+
+    def test_auth_error_falls_open(self, monkeypatch) -> None:
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "error: gh auth login required to access this resource"
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/1") is None
+
+    def test_graphql_404_classified_phantom(self, monkeypatch) -> None:
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "GraphQL: Could not resolve to a PullRequest with the number of 42",
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/42") is False
+
+    def test_markdown_link_url_extracted(self) -> None:
+        """Confirm extraction works inside a markdown link."""
+        from hermes_cli.kanban_completion_gates import _extract_pr_urls
+        urls = _extract_pr_urls(
+            "See [PR #42](https://github.com/o/r/pull/42) for details"
+        )
+        assert urls == ["https://github.com/o/r/pull/42"]
