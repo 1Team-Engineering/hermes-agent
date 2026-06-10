@@ -4540,53 +4540,120 @@ def decompose_triage_task(
     return child_ids
 
 
-_INTEGRATIVE_REVIEW_TITLE = "Integrative architectural review (v6.7 #30)"
+_INTEGRATIVE_REVIEW_TITLE_PREFIX = "Integrative architectural review (v6.7 #30)"
 _REVIEW_ASSIGNEE_ROLES = {"tony", "tchalla", "vision", "reviewer"}
 
+# Strict verdict parser. The verdict line must appear at the start of
+# a line (multiline mode) and the value must be exactly ``approve`` or
+# ``reject`` (followed by whitespace/punctuation/EOL — not by more
+# alphabetic characters). Substring-anywhere matching was the
+# self-review-found bypass: "After consideration my verdict: approve"
+# in prose would match the old check; this regex requires the line
+# anchor so prose mentions never count as the canonical verdict.
+_VERDICT_LINE_RE = re.compile(
+    r"(?mi)^\s*verdict[ \t]*:[ \t]*(approve|reject)\b",
+)
 
-@dataclass(frozen=True)
-class IntegrativeReviewSpawned:
-    """Returned when ``archive_task`` blocks because a v6.7 integrative
-    review was just spawned. Carries the new review's id so callers
-    can surface it to the user / orchestrator. The umbrella task is
-    NOT archived; the caller retries ``archive_task`` after the new
-    review reaches a terminal state with ``verdict: approve``."""
-    umbrella_id: str
-    review_id: str
+
+def _v6_7_parse_verdict(result: Optional[str]) -> Optional[str]:
+    """Return the first ``approve``/``reject`` verdict-line value in
+    ``result`` (case-insensitive), or None if no canonical verdict line
+    is present. The FIRST match wins — a worker can't write
+    ``verdict: approve`` followed by ``verdict: reject`` and have the
+    reject silently overridden.
+    """
+    if not result:
+        return None
+    m = _VERDICT_LINE_RE.search(result)
+    if m is None:
+        return None
+    return m.group(1).lower()
 
 
 def _v6_7_find_existing_integrative_review(
     conn: sqlite3.Connection, umbrella_id: str,
 ) -> Optional[tuple[str, str, Optional[str]]]:
-    """Return ``(review_id, status, result)`` of any existing
-    integrative-review child task for this umbrella, or None."""
-    row = conn.execute(
-        "SELECT t.id, t.status, t.result "
-        "  FROM tasks t JOIN task_links l ON l.child_id = t.id "
-        " WHERE l.parent_id = ? AND t.title = ?",
-        (umbrella_id, _INTEGRATIVE_REVIEW_TITLE),
+    """Return ``(review_id, status, result)`` of the MOST RECENT
+    integrative-review task spawned for this umbrella, or None.
+
+    Reviews are looked up by title prefix + tenant. The relationship
+    is intentionally NOT modeled as a task_links parent edge — that
+    would force the review into ``todo`` status (parents not done) and
+    deadlock the chain. See self-review note in hermes-jarvis#61.
+    Subsequent re-spawn cycles append ``:rN`` to the title so multiple
+    integrative reviews can coexist across remediation rounds.
+    """
+    umbrella = conn.execute(
+        "SELECT tenant FROM tasks WHERE id = ?", (umbrella_id,),
     ).fetchone()
+    if umbrella is None:
+        return None
+    tenant = umbrella["tenant"]
+    # Match by title prefix to handle re-spawned reviews. Most recent
+    # first so a re-spawned review supersedes earlier rejected ones.
+    if tenant is None:
+        row = conn.execute(
+            "SELECT id, status, result FROM tasks "
+            " WHERE title LIKE ? AND tenant IS NULL "
+            " ORDER BY created_at DESC LIMIT 1",
+            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%",),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, status, result FROM tasks "
+            " WHERE title LIKE ? AND tenant = ? "
+            " ORDER BY created_at DESC LIMIT 1",
+            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%", tenant),
+        ).fetchone()
     if row is None:
         return None
     return (row["id"], row["status"], row["result"])
+
+
+def _v6_7_count_integrative_reviews(
+    conn: sqlite3.Connection, umbrella_id: str,
+) -> int:
+    """Count integrative reviews spawned for this umbrella's tenant.
+    Used to compose the next re-spawn's title suffix (``:r2``, ``:r3``)
+    after a rejected verdict."""
+    umbrella = conn.execute(
+        "SELECT tenant FROM tasks WHERE id = ?", (umbrella_id,),
+    ).fetchone()
+    if umbrella is None:
+        return 0
+    tenant = umbrella["tenant"]
+    if tenant is None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            " WHERE title LIKE ? AND tenant IS NULL",
+            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%",),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            " WHERE title LIKE ? AND tenant = ?",
+            (f"{_INTEGRATIVE_REVIEW_TITLE_PREFIX}%", tenant),
+        ).fetchone()
+    return int(row["c"]) if row else 0
 
 
 def _v6_7_should_spawn_integrative_review(
     conn: sqlite3.Connection, umbrella_id: str,
 ) -> bool:
     """True if the umbrella looks like a JARVIS goal-mode chain whose
-    per-block children are all terminal and there's no
-    integrative-review child yet. Conservative — only fires when ALL of:
+    per-block children are all terminal and either no integrative
+    review exists yet, OR the latest one was rejected (re-spawn).
+    Conservative — fires only when ALL of:
 
-    1. Umbrella is ``goal_mode=True`` (JARVIS-style keep_running chain)
-    2. Has at least one child via task_links
-    3. Every non-review child is in {done, archived, blocked} terminal
-    4. At least one review-role child exists (we don't spawn an
-       integrative review for chains that had no per-block reviews)
-    5. No existing integrative-review child task
-
-    These constraints mean a user manually archiving a one-off task
-    won't accidentally trigger the gate.
+    1. Umbrella is ``goal_mode=True`` (JARVIS keep_running chain)
+    2. Has ≥1 child via task_links
+    3. Every non-review child is in {done, archived} (NOT blocked)
+    4. ≥1 review-role child exists (no point integrating over a chain
+       with no per-block reviews)
+    5. ≥1 non-review child exists (don't fire on review-only chains)
+    6. Either no integrative review exists yet, OR the latest one is
+       done with a rejecting verdict (so a re-spawn after remediation
+       is the right move)
     """
     row = conn.execute(
         "SELECT goal_mode FROM tasks WHERE id = ?", (umbrella_id,),
@@ -4594,51 +4661,85 @@ def _v6_7_should_spawn_integrative_review(
     if row is None or not row["goal_mode"]:
         return False
     children = conn.execute(
-        "SELECT t.id, t.status, t.assignee "
+        "SELECT t.id, t.status, t.assignee, t.title "
         "  FROM tasks t JOIN task_links l ON l.child_id = t.id "
         " WHERE l.parent_id = ?",
         (umbrella_id,),
     ).fetchall()
     if not children:
         return False
-    terminal_statuses = {"done", "archived", "blocked"}
+    terminal_statuses = {"done", "archived"}  # blocked is NOT terminal
     has_review_child = False
+    has_non_review_child = False
     for ch in children:
         assignee = (ch["assignee"] or "").lower()
+        title = ch["title"] or ""
+        # Skip past integrative-review children themselves.
+        if title.startswith(_INTEGRATIVE_REVIEW_TITLE_PREFIX):
+            continue
         if assignee in _REVIEW_ASSIGNEE_ROLES:
             has_review_child = True
-            continue  # review children's terminal state doesn't matter here
+            continue
+        has_non_review_child = True
         if ch["status"] not in terminal_statuses:
             return False
-    if not has_review_child:
+    if not has_review_child or not has_non_review_child:
         return False
-    return _v6_7_find_existing_integrative_review(conn, umbrella_id) is None
+    existing = _v6_7_find_existing_integrative_review(conn, umbrella_id)
+    if existing is None:
+        return True
+    review_id, status, result = existing
+    if status not in {"done", "archived"}:
+        return False  # in flight — wait
+    verdict = _v6_7_parse_verdict(result)
+    if verdict == "approve":
+        return False  # archive should proceed
+    # verdict reject (or missing) on a done review — re-spawn after
+    # remediation. The orchestrator is expected to have made changes
+    # before this archive call; the gate fires and creates a fresh
+    # review round (title suffix ``:rN``).
+    return True
 
 
 def _v6_7_spawn_integrative_review(
     conn: sqlite3.Connection, umbrella_id: str,
 ) -> str:
-    """Create the integrative architectural review task as a child of
-    the umbrella. Returns the new task's id."""
+    """Create the integrative architectural review task for this
+    umbrella and return its id.
+
+    Critically, the new task is NOT linked as a child of the umbrella
+    in ``task_links``. Doing so would force ``create_task`` to park
+    the new task in ``todo`` (parents not done), blocking the
+    dispatcher from ever claiming it. The umbrella↔review relationship
+    is recorded as the ``archive_blocked_pending_integrative_review``
+    event on the umbrella.
+
+    A re-spawn after a rejected verdict appends ``:rN`` to the title
+    so multiple integrative reviews can coexist for the same umbrella.
+    """
     umbrella = conn.execute(
         "SELECT tenant, workspace_kind, workspace_path, branch_name "
         "  FROM tasks WHERE id = ?",
         (umbrella_id,),
     ).fetchone()
+    round_num = _v6_7_count_integrative_reviews(conn, umbrella_id) + 1
+    title = _INTEGRATIVE_REVIEW_TITLE_PREFIX
+    if round_num > 1:
+        title = f"{title}:r{round_num}"
     body = (
-        f"## Integrative architectural review (v6.7 #30)\n\n"
-        f"All per-block reviews for umbrella {umbrella_id} are terminal. "
-        f"Before this umbrella can be archived, run ONE final integrative "
-        f"pass that no per-block reviewer could do.\n\n"
+        f"## Integrative architectural review for {umbrella_id}\n\n"
+        f"All per-block reviews are terminal. Before this umbrella "
+        f"can be archived, run ONE final integrative pass that no "
+        f"per-block reviewer could do.\n\n"
         f"### Scope (must address each)\n\n"
-        f"1. **End-to-end request trace**: hit one public entrypoint and "
-        f"follow it through every layer. Count DB round-trips, identify "
-        f"caches, note any layer that opens the same connection more than "
-        f"once.\n"
-        f"2. **End-to-end page render trace**: hit one user-facing page and "
-        f"trace layout + leaf execution. Look for redundant server work, "
-        f"abs-path leaks, and any state pulled at request time that could "
-        f"leak across users.\n"
+        f"1. **End-to-end request trace**: hit one public entrypoint "
+        f"and follow it through every layer. Count DB round-trips, "
+        f"identify caches, note any layer that opens the same "
+        f"connection more than once.\n"
+        f"2. **End-to-end page render trace**: hit one user-facing "
+        f"page and trace layout + leaf execution. Look for redundant "
+        f"server work, abs-path leaks, and any state pulled at request "
+        f"time that could leak across users.\n"
         f"3. **Adversarial enumeration**: list every env var, request "
         f"input, file path, and external IO surface the deliverable "
         f"touches. For each, name the bound enforced.\n"
@@ -4646,15 +4747,15 @@ def _v6_7_spawn_integrative_review(
         f"upstream API, environment variable. Follow the error to the "
         f"user. Does it leak server-side info? Does the dispatcher "
         f"swallow it? Does the user see a stack trace?\n\n"
-        f"Verdict format (v6.7 #29/#31): `verdict: approve | reject` "
-        f"plus `test_quality:` (imports_match + evidence) plus "
-        f"`adversarial_pass:` block. See profile SOUL for the full shape."
+        f"Round {round_num}. The verdict line MUST be a literal "
+        f"``verdict: approve`` or ``verdict: reject`` at the start of "
+        f"a line (other prose mentions of those words don't count). "
+        f"On approve, the umbrella can archive; on reject, the "
+        f"orchestrator remediates and a fresh integrative review is "
+        f"auto-spawned the next archive attempt."
     )
     workspace_kind = (umbrella["workspace_kind"] or "scratch")
     workspace_path = umbrella["workspace_path"]
-    # If umbrella uses a worktree, the review uses the same dir so
-    # tchalla can run `gh pr diff` and exercise `npm test` etc. against
-    # the actual deliverable.
     review_workspace_kind = (
         "dir" if workspace_kind in {"dir", "worktree"} else "scratch"
     )
@@ -4663,32 +4764,37 @@ def _v6_7_spawn_integrative_review(
     )
     return create_task(
         conn,
-        title=_INTEGRATIVE_REVIEW_TITLE,
+        title=title,
         body=body,
         assignee="tchalla",
         created_by="dispatcher",
         workspace_kind=review_workspace_kind,
         workspace_path=review_workspace_path,
         tenant=umbrella["tenant"],
-        parents=[umbrella_id],
-        idempotency_key=f"v6.7-integrative-review:{umbrella_id}",
-        initial_status="running",  # auto-ready since umbrella is the parent
+        # Intentionally NO parents — see docstring.
+        idempotency_key=f"v6.7-integrative-review:{umbrella_id}:r{round_num}",
+        initial_status="running",
     )
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    # v6.7 #30 — block JARVIS-umbrella archives until the integrative
-    # architectural review is approved. Other tasks (or umbrellas
-    # without per-block reviews) archive normally. See
-    # hermes-jarvis#61 for the bootstrap-paradox case study.
-    if _v6_7_should_spawn_integrative_review(conn, task_id):
-        review_id = _v6_7_spawn_integrative_review(conn, task_id)
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "archive_blocked_pending_integrative_review",
-                {"review_id": review_id},
-            )
-        return False
+    """Transition a task to ``archived`` status.
+
+    For JARVIS goal_mode umbrellas with per-block reviews terminal
+    (the canonical v6.7 chain shape), this function blocks the archive
+    until an integrative architectural review (v6.7 #30) is spawned
+    and approved. The integrative review is created as a peer task
+    (not a child) with assignee=tchalla and the verdict-format pointer
+    in its body. Subsequent archive calls inspect the review state:
+
+    - Review missing or rejected → spawn a new one, return False
+    - Review in flight (running/ready/blocked) → return False
+    - Review done with ``verdict: approve`` → archive proceeds
+
+    See hermes-jarvis#30 + #61 for the case study and design.
+    """
+    # Two-stage handling: first check existing review state, then
+    # decide whether to spawn.
     existing = _v6_7_find_existing_integrative_review(conn, task_id)
     if existing is not None:
         review_id, status, result = existing
@@ -4699,18 +4805,38 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
                     {"review_id": review_id, "review_status": status},
                 )
             return False
-        # Done — verdict must approve. A rejecting verdict still blocks
-        # archive; the umbrella needs to remediate then re-spawn the
-        # review.
-        verdict_ok = bool(result) and "verdict: approve" in result.lower()
-        if not verdict_ok:
+        verdict = _v6_7_parse_verdict(result)
+        if verdict == "approve":
+            pass  # fall through to actual archive
+        else:
+            # Rejected (or no canonical verdict) — only re-spawn if the
+            # umbrella looks ready for another round. The
+            # _should_spawn check below picks this up.
+            if _v6_7_should_spawn_integrative_review(conn, task_id):
+                new_review_id = _v6_7_spawn_integrative_review(conn, task_id)
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "archive_blocked_pending_integrative_review",
+                        {"review_id": new_review_id,
+                         "supersedes": review_id,
+                         "supersedes_verdict": verdict or "missing"},
+                    )
+                return False
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "archive_blocked_integrative_review_rejected",
-                    {"review_id": review_id, "result_preview":
-                     (result or "")[:200]},
+                    {"review_id": review_id, "verdict": verdict or "missing",
+                     "result_preview": (result or "")[:200]},
                 )
             return False
+    elif _v6_7_should_spawn_integrative_review(conn, task_id):
+        review_id = _v6_7_spawn_integrative_review(conn, task_id)
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "archive_blocked_pending_integrative_review",
+                {"review_id": review_id},
+            )
+        return False
 
     with write_txn(conn):
         cur = conn.execute(
