@@ -1336,3 +1336,121 @@ class TestDocDrift:
             workspace_path=str(tmp_path),
             allow_doc_drift=True,
         ) is None
+
+    # === self-review fixes ===
+
+    def test_nested_history_heading_does_not_exit_history(
+        self, tmp_path: Path,
+    ) -> None:
+        """Self-review #5: a `### v6.2 details` subsection under
+        `## History` used to exit history mode (the new heading reset
+        in_history to False). Now depth-aware: subsection only exits
+        history when level <= history_depth AND it's not itself a
+        history heading."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\n"
+            "Current target: v6.6\n\n"
+            "## History\n\n"
+            "### v6.2 details\n\n"
+            "We did v6.2 things here.\n\n"
+            "### v6.5 details\n\n"
+            "Added the dispatcher heartbeat.\n",
+        )
+        assert verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        ) is None
+
+    def test_nonhistory_heading_at_history_level_exits_history(
+        self, tmp_path: Path,
+    ) -> None:
+        """The complement of the previous test: a sibling heading at
+        the same level (here `## Roadmap`) DOES exit the history
+        section, so a stale v6.2 there gets flagged."""
+        _make_repo_with_doc(
+            tmp_path, "README.md",
+            "# Project (v6.6)\n\n"
+            "## History\n\n"
+            "- v6.2 was the first cut.\n\n"
+            "## Roadmap\n\n"
+            "Considering features carried over from v6.2.\n",
+        )
+        v = verify_doc_drift(
+            tenant="marvel-swarm-v6-6-test",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        assert v is not None
+        # The v6.2 inside ## History is excused; only the one under
+        # ## Roadmap should count.
+        assert v.stale_refs == (("README.md", "v6.2"),)
+
+
+class TestPRExistenceErrorClassification:
+    """Self-review #2: the substring matcher for `_gh_pr_exists`
+    confused DNS / network errors with 404. Now those fall open as
+    indeterminate, not phantom."""
+
+    def _make_run(self, returncode: int, stderr: str):
+        class _R:
+            def __init__(self, rc, se):
+                self.returncode = rc
+                self.stdout = ""
+                self.stderr = se
+        return _R(returncode, stderr)
+
+    def test_dns_error_falls_open(self, monkeypatch) -> None:
+        """`could not resolve host: api.github.com` no longer counts
+        as a 404."""
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "could not resolve host: api.github.com"
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/1") is None
+
+    def test_tls_error_falls_open(self, monkeypatch) -> None:
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "tls handshake error: connection reset"
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/1") is None
+
+    def test_auth_error_falls_open(self, monkeypatch) -> None:
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "error: gh auth login required to access this resource"
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/1") is None
+
+    def test_graphql_404_classified_phantom(self, monkeypatch) -> None:
+        from hermes_cli import kanban_completion_gates as gates
+        monkeypatch.setattr("shutil.which", lambda *_: "/usr/local/bin/gh")
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **k: self._make_run(
+                1, "GraphQL: Could not resolve to a PullRequest with the number of 42",
+            ),
+        )
+        assert gates._gh_pr_exists("https://github.com/o/r/pull/42") is False
+
+    def test_markdown_link_url_extracted(self) -> None:
+        """Confirm extraction works inside a markdown link."""
+        from hermes_cli.kanban_completion_gates import _extract_pr_urls
+        urls = _extract_pr_urls(
+            "See [PR #42](https://github.com/o/r/pull/42) for details"
+        )
+        assert urls == ["https://github.com/o/r/pull/42"]

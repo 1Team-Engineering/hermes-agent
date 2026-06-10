@@ -765,7 +765,16 @@ def _gh_pr_exists(url: str) -> Optional[bool]:
     """Return True if the URL resolves via `gh pr view`, False if it
     explicitly doesn't exist, None on indeterminate (gh missing /
     network error / unauthenticated). Indeterminate falls open (the
-    gate doesn't reject) so transient gh problems don't trap workers."""
+    gate doesn't reject) so transient gh problems don't trap workers.
+
+    404 detection is conservative: we look for the GraphQL not-found
+    phrase ("could not resolve to a") and the legacy "not found"
+    pattern but explicitly exclude network-error variants like "could
+    not resolve host" (DNS) and "not found" that co-occurs with
+    network/host tokens. Self-review note: a DNS failure used to be
+    misclassified as a phantom PR, which then trapped workers behind
+    a flaky network.
+    """
     import shutil
     if not shutil.which("gh"):
         return None
@@ -778,11 +787,18 @@ def _gh_pr_exists(url: str) -> Optional[bool]:
         return None
     if out.returncode == 0:
         return True
-    # Distinguish "not found" from auth/network errors: stderr usually
-    # mentions "Not Found" / "GraphQL: Could not resolve" on 404. Other
-    # failures (auth, network) we treat as indeterminate.
     stderr = (out.stderr or "").lower()
-    if "not found" in stderr or "could not resolve" in stderr or "no pull request" in stderr:
+    network_tokens = ("host", "dial", "timeout", "network", "tls", "i/o timeout")
+    is_network = any(tok in stderr for tok in network_tokens)
+    if is_network:
+        return None
+    # The GraphQL 404 wording is exact: "could not resolve to a <Type>".
+    if "could not resolve to a" in stderr:
+        return False
+    if "no pull request" in stderr:
+        return False
+    # Legacy "not found" only when there's no network token in stderr.
+    if "not found" in stderr:
         return False
     return None
 
@@ -872,25 +888,33 @@ def _scan_doc_for_stale(
     path: str, active: tuple[int, int],
 ) -> list[str]:
     """Return list of stale version strings found in ``path`` outside
-    a history/older-versions heading. Empty list = no drift."""
+    a history/older-versions heading. Empty list = no drift.
+
+    Depth-aware: a ``## History`` block stays in history mode until a
+    non-history heading of equal-or-shallower depth appears. So
+    ``## History\\n### v6.2 details`` correctly treats the subsection
+    as historical content (self-review fix).
+    """
     try:
         text = open(path, encoding="utf-8", errors="replace").read()
     except (OSError, IOError):
         return []
-    # Heuristic for history sections: any heading containing "history",
-    # "older", "previous", "changelog" puts subsequent content in
-    # historical context.
-    in_history = False
     stale: list[str] = []
     version_re = re.compile(r"\bv(\d+)[\.\-](\d+)\b", re.IGNORECASE)
     history_heading_re = re.compile(
         r"^#+\s*.*(?:history|older|previous|changelog|archive)",
         re.IGNORECASE,
     )
+    history_depth: Optional[int] = None
     for line in text.splitlines():
         if line.startswith("#"):
-            in_history = bool(history_heading_re.match(line))
-        if in_history:
+            level = len(line) - len(line.lstrip("#"))
+            is_hist = bool(history_heading_re.match(line))
+            if is_hist:
+                history_depth = level
+            elif history_depth is not None and level <= history_depth:
+                history_depth = None
+        if history_depth is not None:
             continue
         for m in version_re.finditer(line):
             v_major, v_minor = int(m.group(1)), int(m.group(2))
