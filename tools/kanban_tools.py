@@ -630,11 +630,22 @@ def _handle_block(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.block_task(
-                conn, tid,
-                reason=reason,
-                expected_run_id=_worker_run_id(tid),
-            )
+            try:
+                ok = kb.block_task(
+                    conn, tid,
+                    reason=reason,
+                    expected_run_id=_worker_run_id(tid),
+                )
+            except kb.FabricatedAuthClaimError as fab_err:
+                # v6.7 gate rejected the block — the reason claimed
+                # github auth was missing but the dispatcher's shell
+                # IS authed. Task state unchanged; the worker has to
+                # surface the real cause and call kanban_block again.
+                # See hermes-jarvis#65.
+                return tool_error(
+                    f"{fab_err}\nYour task is still in-flight "
+                    f"(no state change)."
+                )
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
