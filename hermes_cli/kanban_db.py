@@ -93,6 +93,7 @@ from toolsets import get_toolset_names
 from hermes_cli.kanban_completion_gates import (
     CompletionGateError,
     verify_no_stray_artifacts,
+    verify_reviewer_fields,
     verify_runtime_floor,
     verify_workspace_diff,
 )
@@ -3613,15 +3614,17 @@ def _v6_7_run_completion_gates(
     conn: sqlite3.Connection,
     task_id: str,
     *,
+    result: Optional[str],
     summary: Optional[str],
     metadata: Optional[dict],
     now: int,
 ) -> list:
-    """Run the v6.7 Tranche 1 completion gates and return any violations.
+    """Run the v6.7 completion gates and return any violations.
 
-    Reads task assignee / workspace / started_at from the tasks row and
-    delegates to the pure gate functions in ``kanban_completion_gates``.
-    Returns an empty list when all gates pass.
+    Reads task assignee / body / workspace / started_at from the tasks
+    row and delegates to the pure gate functions in
+    ``kanban_completion_gates``. Returns an empty list when all gates
+    pass.
 
     Workers may opt out of individual gates via per-call metadata keys.
     Each opt-out value MUST be a non-empty string of at least
@@ -3635,9 +3638,10 @@ def _v6_7_run_completion_gates(
         - ``x_fast_justified`` — skip runtime-floor (#64)
         - ``x_no_code`` — skip workspace-diff (#62)
         - ``x_stray_ok`` — skip repo-hygiene (#28)
+        - ``x_no_reviewer_fields`` — skip reviewer-fields (#29, #31)
     """
     row = conn.execute(
-        "SELECT assignee, workspace_kind, workspace_path, started_at "
+        "SELECT assignee, body, workspace_kind, workspace_path, started_at "
         "  FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -3647,11 +3651,13 @@ def _v6_7_run_completion_gates(
     fast_ok_reason = _validate_opt_out(task_id, "x_fast_justified", md.get("x_fast_justified"))
     no_code_reason = _validate_opt_out(task_id, "x_no_code", md.get("x_no_code"))
     stray_ok_reason = _validate_opt_out(task_id, "x_stray_ok", md.get("x_stray_ok"))
+    no_rf_reason = _validate_opt_out(task_id, "x_no_reviewer_fields", md.get("x_no_reviewer_fields"))
     accepted_opt_outs = {
         k: v for k, v in (
             ("x_fast_justified", fast_ok_reason),
             ("x_no_code", no_code_reason),
             ("x_stray_ok", stray_ok_reason),
+            ("x_no_reviewer_fields", no_rf_reason),
         ) if v is not None
     }
     if accepted_opt_outs:
@@ -3663,6 +3669,7 @@ def _v6_7_run_completion_gates(
     fast_ok = fast_ok_reason is not None
     no_code = no_code_reason is not None
     stray_ok = stray_ok_reason is not None
+    no_reviewer_fields = no_rf_reason is not None
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
@@ -3688,6 +3695,14 @@ def _v6_7_run_completion_gates(
     )
     if stray is not None:
         violations.append(stray)
+    reviewer = verify_reviewer_fields(
+        assignee=row["assignee"],
+        body=row["body"],
+        result=result,
+        allow_no_reviewer_fields=no_reviewer_fields,
+    )
+    if reviewer is not None:
+        violations.append(reviewer)
     return violations
 
 
@@ -3763,7 +3778,7 @@ def complete_task(
     # _verify_created_cards: any violation raises before state changes, so
     # the worker can retry after fixing the underlying issue.
     _violations = _v6_7_run_completion_gates(
-        conn, task_id, summary=summary, metadata=metadata, now=now,
+        conn, task_id, result=result, summary=summary, metadata=metadata, now=now,
     )
     if _violations:
         with write_txn(conn):

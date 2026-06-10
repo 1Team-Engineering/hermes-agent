@@ -406,6 +406,323 @@ def verify_no_stray_artifacts(
 
 
 # =====================================================================
+# Reviewer-field gate (#29, #31)
+# =====================================================================
+
+# Surfaces in the task body that mean the deliverable touches HTTP /
+# server / public-API code. Tightened after self-review: the original
+# `\bopenapi\b` and `\bpublic-api\b` patterns false-positived on docs
+# bodies (e.g., "Review the OpenAPI spec docs"). New rule: each pattern
+# requires path-like context (`app/api/`, `/server/`, `.ts`, etc.) so
+# prose mentions don't trigger.
+_ADVERSARIAL_TRIGGER_PATTERNS = [
+    re.compile(r"\bapp/api/[A-Za-z_\-]", re.IGNORECASE),
+    re.compile(r"(^|[\s/])server/[A-Za-z_\-]", re.IGNORECASE),
+    re.compile(r"\broute\.ts\b", re.IGNORECASE),
+    re.compile(r"\bopenapi[\.-/]", re.IGNORECASE),  # openapi.yaml/openapi-spec/openapi/...
+    re.compile(r"\brequest handler.*\.(ts|tsx|js|py|go|rs)\b", re.IGNORECASE),
+    re.compile(r"\bhttp endpoint[\s:].*[/\.]", re.IGNORECASE),
+]
+
+# Reviewer fields are parsed by walking the verdict text line-by-line
+# rather than with regex. YAML-ish indentation makes the boundary rules
+# clean: a "field" is a line of the form ``<indent>key:[ value]``, and
+# its body is the consecutive following lines indented STRICTLY DEEPER
+# than the field line. The next sibling field (same or shallower
+# indent) ends the body. This stops the regex-leech bug where one
+# section's content was captured as if it belonged to an earlier
+# section.
+MIN_FIELD_VALUE_LEN = 20
+
+_FIELD_HEADER_RE = re.compile(
+    r"^([ \t]*)([A-Za-z_][\w-]*)[ \t]*:[ \t]*(.*?)[ \t]*$"
+)
+_IMPORTS_VALUE_RE = re.compile(
+    r"^(?:(true|false)\b"
+    r"|not_applicable[ \t]*:[ \t]*(.+?))[ \t]*$",
+    re.IGNORECASE,
+)
+
+# Real citations the evidence field must contain — at least one bullet
+# item line that names a test path AND a line:column reference. This
+# stops a Tony from writing prose ("this is just prose about why we
+# approve") into evidence:.
+_EVIDENCE_CITATION_RE = re.compile(
+    r"(?m)^\s*[-*]\s+.*(?:tests?[/_.][\w/.\-]+|\.test\.[\w.]+|"
+    r"_test\.[\w.]+|spec\.[\w.]+)[^\n]*?:\d+",
+)
+
+
+@dataclass(frozen=True)
+class MissingReviewerFieldViolation:
+    assignee: str
+    missing_fields: tuple[str, ...]
+    body_excerpt: str
+
+    def message(self) -> str:
+        listing = "\n  - ".join(self.missing_fields)
+        return (
+            f"reviewer-fields: {self.assignee} verdict is missing required "
+            f"discipline fields:\n  - {listing}\n"
+            f"Each missing field must appear in the verdict text with a real "
+            f"value (not a placeholder). Format example:\n"
+            f"  test_quality:\n"
+            f"    imports_match_deliverable_entrypoints: true\n"
+            f"    evidence:\n"
+            f"      - tests/integration.test.ts:42 calls app/api/metrics/route.ts:GET\n"
+            f"      - tests/integration.test.ts:88 invokes app/[view]/page.tsx default export\n"
+            f"  adversarial_pass:\n"
+            f"    env_vars:\n"
+            f"      - AGENT_DASHBOARD_DB: allowlisted to ~/.hermes/ (lib/ingest.ts:92)\n"
+            f"    request_inputs: []\n"
+            f"    file_paths:\n"
+            f"      - db open paths: allowlisted (lib/ingest.ts:88)\n"
+            f"    external_io: []\n"
+            f"The evidence field MUST be a bullet list with each item naming "
+            f"both a test path (tests/..., *.test.*, or *_test.*) AND a "
+            f"line:column reference. Prose evidence is rejected. If a section "
+            f"is genuinely not applicable, write it as "
+            f"`not_applicable: <reason at least 8 chars>` instead of omitting it."
+        )
+
+
+def _body_triggers_adversarial(body: str) -> bool:
+    return any(p.search(body or "") for p in _ADVERSARIAL_TRIGGER_PATTERNS)
+
+
+def _captured_value_substantive(captured: str) -> bool:
+    """True if ``captured`` looks like a real value rather than a
+    leech or placeholder."""
+    stripped = captured.strip()
+    if not stripped:
+        return False
+    # Explicit empty list / none — honest enumerations are valid.
+    head = stripped.split("\n", 1)[0].strip()
+    if head in {"[]", "{}", "none", "None", "NONE", "n/a", "N/A"}:
+        return True
+    return len(stripped) >= MIN_FIELD_VALUE_LEN
+
+
+def _parse_field(text: str, *path: str) -> Optional[tuple[str, str]]:
+    """Walk ``text`` line-by-line and return ``(inline_value, body)`` for
+    the field located by ``path`` (e.g., ``("test_quality", "evidence")``),
+    or ``None`` if the path doesn't resolve.
+
+    ``inline_value`` is the same-line content after the colon (stripped).
+    ``body`` is the concatenation of subsequent lines indented strictly
+    deeper than the field's line (newlines preserved). A sibling at
+    equal or shallower indent ends the body.
+
+    For nested paths (parent.child), the child's body must be searched
+    within the parent's body. The parent body is found first; the child
+    is looked up inside it as if the body were a standalone document.
+    """
+    if not text or not path:
+        return None
+    lines = text.splitlines()
+    # Find the top-level key first.
+    head_key = path[0]
+    head_idx = None
+    head_indent = None
+    head_inline = ""
+    for i, line in enumerate(lines):
+        m = _FIELD_HEADER_RE.match(line)
+        if not m:
+            continue
+        if m.group(2).lower() != head_key.lower():
+            continue
+        head_idx = i
+        head_indent = m.group(1)
+        head_inline = m.group(3)
+        break
+    if head_idx is None:
+        return None
+    head_body_lines: list[str] = []
+    deeper = head_indent + " "  # any string strictly longer than head_indent
+    for line in lines[head_idx + 1:]:
+        if not line.strip():
+            head_body_lines.append(line)
+            continue
+        leading = len(line) - len(line.lstrip(" \t"))
+        if leading <= len(head_indent):
+            break
+        head_body_lines.append(line)
+    if len(path) == 1:
+        return head_inline, "\n".join(head_body_lines).strip("\n")
+    # Recurse into the body for child path.
+    body_text = "\n".join(head_body_lines)
+    return _parse_field(body_text, *path[1:])
+
+
+# For adversarial_pass.* fields, a substantive value must either be
+# an explicit empty marker or contain a structural cue that the
+# reviewer actually enumerated something: a bullet item, an env-var
+# token (UPPER_SNAKE), a path-like substring (a/b), a file extension
+# of source code shape, or a colon-separated "<name>: <bound>" on the
+# same line. Pure prose ≥20 chars no longer satisfies the gate — that
+# was the same shape as the prose-evidence bypass we fixed for
+# test_quality.evidence (hermes-jarvis#61 N2 self-review).
+_ADVERSARIAL_BULLET_RE = re.compile(r"(?m)^\s*[-*]\s+\S+")
+_ADVERSARIAL_ENV_VAR_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b\s*:")
+_ADVERSARIAL_PATH_RE = re.compile(r"\b[\w-]+/[\w./-]+")
+# Code-only extensions. Docs/config extensions (md/yaml/yml/json/txt)
+# are intentionally excluded — workers commonly mention "README.md" or
+# "config.yaml" in prose, which gave a marker-padding bypass through
+# the adversarial structure check. If a reviewer's evidence genuinely
+# touches a yaml/json/md path, they can still satisfy the gate via the
+# path-with-slash regex above (e.g. "configs/app.yaml" matches
+# _ADVERSARIAL_PATH_RE).
+_ADVERSARIAL_SOURCE_FILE_RE = re.compile(
+    r"\b[\w-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|rb|kt|swift|c|cpp|cc|h|hpp|cs|scala|clj|ex|exs|erl|lua|sh)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_adversarial_structure(text: str) -> bool:
+    return bool(
+        _ADVERSARIAL_BULLET_RE.search(text)
+        or _ADVERSARIAL_ENV_VAR_RE.search(text)
+        or _ADVERSARIAL_PATH_RE.search(text)
+        or _ADVERSARIAL_SOURCE_FILE_RE.search(text)
+    )
+
+# Empty-marker tokens accepted as honest declarations.
+_HONEST_EMPTY_MARKERS = {"none", "[]", "{}", "n/a"}
+
+
+def _adversarial_value_substantive(captured: str) -> bool:
+    """True if an adversarial_pass.* value's content shows the reviewer
+    enumerated structure rather than padded with prose. Honest empty
+    markers are accepted."""
+    stripped = captured.strip()
+    if not stripped:
+        return False
+    head = stripped.split("\n", 1)[0].strip().lower()
+    if head in _HONEST_EMPTY_MARKERS:
+        return True
+    return _has_adversarial_structure(stripped)
+
+
+def _field_present(field_key: str, text: str, *, code_change_context: bool = False) -> bool:
+    """True if the verdict text shows the field with a real value.
+
+    ``code_change_context`` (when True) forbids the honest-empty escape
+    on ``test_quality.evidence`` — a reviewer of code touching HTTP /
+    server surfaces must produce real test citations, not a bare
+    ``none``. Closes hermes-jarvis#61 N6 self-review note.
+    """
+    if field_key == "test_quality.imports_match_deliverable_entrypoints":
+        parsed = _parse_field(text or "", "test_quality", "imports_match_deliverable_entrypoints")
+        if parsed is None:
+            return False
+        inline, body = parsed
+        candidate = inline.strip() if inline else ""
+        if not candidate and body.strip():
+            candidate = body.strip().splitlines()[0].strip()
+        if not candidate:
+            return False
+        m = _IMPORTS_VALUE_RE.match(candidate)
+        if not m:
+            return False
+        if m.group(1):
+            return True
+        reason = (m.group(2) or "").strip()
+        return len(reason) >= 8
+
+    # Multi-key field
+    path = tuple(field_key.split("."))
+    parsed = _parse_field(text or "", *path)
+    if parsed is None:
+        return False
+    inline, body = parsed
+    inline = inline.strip()
+    body = body.strip("\n")
+
+    # adversarial_pass.* — structure-required.
+    if field_key.startswith("adversarial_pass."):
+        if inline:
+            return _adversarial_value_substantive(inline)
+        return _adversarial_value_substantive(body)
+
+    # test_quality.evidence — citation-required, or honest-empty
+    # (unless code_change_context forbids the empty escape).
+    if field_key == "test_quality.evidence":
+        if inline:
+            inline_low = inline.lower()
+            if inline_low in _HONEST_EMPTY_MARKERS:
+                return not code_change_context
+            return False  # inline prose like "evidence: see above" never qualifies
+        if not _captured_value_substantive(body):
+            return False
+        head = body.strip().split("\n", 1)[0].strip().lower()
+        if head in _HONEST_EMPTY_MARKERS:
+            return not code_change_context
+        return bool(_EVIDENCE_CITATION_RE.search(body))
+
+    # Other multi-key fields (currently none) fall through.
+    if inline:
+        return inline.lower() in _HONEST_EMPTY_MARKERS or len(inline) >= MIN_FIELD_VALUE_LEN
+    return _captured_value_substantive(body)
+
+
+def verify_reviewer_fields(
+    assignee: Optional[str],
+    body: Optional[str],
+    result: Optional[str],
+    *,
+    allow_no_reviewer_fields: bool = False,
+) -> Optional[MissingReviewerFieldViolation]:
+    """Reject reviewer completions missing structured discipline fields.
+
+    Skipped (returns None) when:
+    - assignee isn't a review role
+    - caller opted out via ``allow_no_reviewer_fields=True``
+
+    Always required for reviewers:
+    - ``test_quality.imports_match_deliverable_entrypoints`` (true|false|not_applicable)
+    - ``test_quality.evidence`` — at least one bullet-list line citing a
+      test path AND a ``:N`` line reference, OR an explicit empty marker
+
+    Additionally required when the task body mentions HTTP/server
+    surfaces in a path-like context (``app/api/<file>``, ``server/<file>``,
+    ``route.ts``, ``openapi.<ext>``, etc.):
+    - ``adversarial_pass.env_vars`` / ``request_inputs`` / ``file_paths`` /
+      ``external_io`` — each substantive or explicit empty marker
+    """
+    if allow_no_reviewer_fields:
+        return None
+    if not assignee or assignee.lower() not in REVIEW_ROLES:
+        return None
+    text = result or ""
+    required = [
+        "test_quality.imports_match_deliverable_entrypoints",
+        "test_quality.evidence",
+    ]
+    code_change = _body_triggers_adversarial(body or "")
+    if code_change:
+        required.extend([
+            "adversarial_pass.env_vars",
+            "adversarial_pass.request_inputs",
+            "adversarial_pass.file_paths",
+            "adversarial_pass.external_io",
+        ])
+    missing = [
+        f for f in required
+        if not _field_present(f, text, code_change_context=code_change)
+    ]
+    if not missing:
+        return None
+    # Defensive — empty/None body used to crash on splitlines()[0]
+    # before the gate could surface its violation.
+    body_lines = (body or "").strip().splitlines()
+    body_excerpt = body_lines[0][:200] if body_lines else ""
+    return MissingReviewerFieldViolation(
+        assignee=assignee, missing_fields=tuple(missing),
+        body_excerpt=body_excerpt,
+    )
+
+
+# =====================================================================
 # Exception class for the integration in `complete_task`
 # =====================================================================
 

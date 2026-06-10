@@ -17,10 +17,12 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.kanban_completion_gates import (
+    MissingReviewerFieldViolation,
     RuntimeFloorViolation,
     StrayArtifactViolation,
     WorkspaceDiffViolation,
     verify_no_stray_artifacts,
+    verify_reviewer_fields,
     verify_runtime_floor,
     verify_workspace_diff,
 )
@@ -596,3 +598,515 @@ class TestCompleteTaskIntegration:
             "SELECT status FROM tasks WHERE id = 't_int'"
         ).fetchone()
         assert row["status"] == "done"
+
+
+# =====================================================================
+# verify_reviewer_fields — #29, #31 (with self-review tightening)
+# =====================================================================
+
+# Baseline valid verdict (test_quality only). Citations follow the
+# required structure: bullet item with a tests path AND a :N reference.
+_GOOD_BASELINE = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/integration.test.ts:42 calls app/api/metrics/route.ts:GET
+    - tests/integration.test.ts:88 invokes app/[view]/page.tsx default export
+"""
+
+# Full verdict including adversarial_pass for HTTP/server tasks.
+_GOOD_FULL = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/integration.test.ts:42 calls app/api/metrics/route.ts:GET
+    - tests/integration.test.ts:88 invokes app/[view]/page.tsx default export
+
+adversarial_pass:
+  env_vars:
+    - AGENT_DASHBOARD_DB: allowlisted to ~/.hermes/ (lib/ingest.ts:92)
+    - HERMES_KANBAN_DB: same as above
+  request_inputs: []
+  file_paths:
+    - DB open paths: allowlisted (lib/ingest.ts:88)
+  external_io: []
+"""
+
+
+class TestReviewerFields:
+    def test_tony_bare_approve_rejected(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review Block C and return verdict per kanban-worker convention.",
+            result="verdict: approve\n",
+        )
+        assert isinstance(v, MissingReviewerFieldViolation)
+        assert "test_quality.imports_match_deliverable_entrypoints" in v.missing_fields
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_baseline_fields_pass_for_pure_code_review(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to hermes_cli/kanban_completion_gates.py",
+            result=_GOOD_BASELINE,
+        )
+        assert v is None
+
+    def test_app_api_body_requires_adversarial_pass(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review remediation: changes to app/api/metrics/route.ts and lib/ingest.ts",
+            result=_GOOD_BASELINE,
+        )
+        assert v is not None
+        assert all(f in v.missing_fields for f in [
+            "adversarial_pass.env_vars",
+            "adversarial_pass.request_inputs",
+            "adversarial_pass.file_paths",
+            "adversarial_pass.external_io",
+        ])
+        # test_quality already satisfied
+        assert "test_quality.evidence" not in v.missing_fields
+
+    def test_full_verdict_passes_with_adversarial_trigger(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review remediation: app/api/metrics/route.ts and lib/ingest.ts",
+            result=_GOOD_FULL,
+        )
+        assert v is None
+
+    # === self-review P0/P1 fix tests ===
+
+    def test_field_leech_rejected(self) -> None:
+        """The PR-#12 P0: unanchored captures let one section's content
+        leech into earlier empty fields. After bounding captures with
+        the next-field-key lookahead, empty `env_vars:`/`request_inputs:`/
+        `file_paths:` are recognized as missing even if `external_io:`
+        has lots of content."""
+        leech_verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars:
+  request_inputs:
+  file_paths:
+  external_io:
+    - lots of content past 20 chars but only this section has real text
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=leech_verdict,
+        )
+        assert v is not None
+        assert "adversarial_pass.env_vars" in v.missing_fields
+        assert "adversarial_pass.request_inputs" in v.missing_fields
+        assert "adversarial_pass.file_paths" in v.missing_fields
+        # external_io DOES have substantive content — that one passes
+        assert "adversarial_pass.external_io" not in v.missing_fields
+
+    def test_prose_evidence_rejected(self) -> None:
+        """The PR-#12 P0: `test_quality.evidence` must be enumerated
+        test→deliverable citations, not free prose. Tony writing a
+        paragraph of justification under `evidence:` no longer
+        satisfies the gate."""
+        prose_verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    this is just prose about why we approve, not an enumerated test list
+    talking about coverage in general terms with no specific citation
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review code",
+            result=prose_verdict,
+        )
+        assert v is not None
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_empty_not_applicable_rejected(self) -> None:
+        """The PR-#12 P1: ``not_applicable:`` with no reason was
+        previously accepted via greedy capture into the next field. Now
+        the capture is anchored to the line terminator and the reason
+        must be at least 8 chars."""
+        empty_na_verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable:
+  evidence:
+    - tests/foo.test.ts:1 covers app/foo.ts:exported function
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review docs change",
+            result=empty_na_verdict,
+        )
+        assert v is not None
+        assert "test_quality.imports_match_deliverable_entrypoints" in v.missing_fields
+
+    def test_not_applicable_with_real_reason_passes(self) -> None:
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable: pure docs reshuffle, no entrypoints touched
+  evidence:
+    - README.md updates only, no test changes needed
+"""
+        # Evidence here has no :N citation. To accept this we need the
+        # honest-empty escape — let's use that.
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable: pure docs reshuffle, no entrypoints touched
+  evidence: none
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review docs reshuffle",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_docs_only_openapi_mention_does_not_trigger_adversarial(self) -> None:
+        """The PR-#12 P1: original `\\bopenapi\\b` matched prose. After
+        tightening, an OpenAPI prose mention without a path doesn't
+        force adversarial_pass."""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the OpenAPI spec documentation update",
+            result=_GOOD_BASELINE,
+        )
+        assert v is None
+
+    def test_openapi_with_path_does_trigger_adversarial(self) -> None:
+        """The legitimate trigger: openapi.yaml or openapi/ as part of
+        the actual deliverable surface still triggers."""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to openapi.yaml and the request handler in src/server/handlers/users.ts",
+            result=_GOOD_BASELINE,
+        )
+        assert v is not None
+        assert any("adversarial_pass" in m for m in v.missing_fields)
+
+    def test_non_review_role_skipped(self) -> None:
+        assert (
+            verify_reviewer_fields(
+                assignee="friday",
+                body="Implement gates per spec",
+                result="Implementation done.",
+            )
+            is None
+        )
+
+    def test_x_no_reviewer_fields_opt_out(self) -> None:
+        """The reviewer-fields opt-out is itself just a flag at this
+        layer (the opt-out audit happens in
+        `_v6_7_run_completion_gates`, not in the pure function)."""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review",
+            result="verdict: approve",
+            allow_no_reviewer_fields=True,
+        )
+        assert v is None
+
+    def test_tchalla_and_vision_get_same_discipline(self) -> None:
+        for role in ("tchalla", "vision"):
+            v = verify_reviewer_fields(
+                assignee=role,
+                body="Review",
+                result="verdict: approve",
+            )
+            assert v is not None
+
+    def test_case_insensitive_role_match(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="Tony",
+            body="Review",
+            result="verdict: approve",
+        )
+        assert v is not None
+
+
+class TestReviewerFieldsIntegration:
+    """Through-the-public-API tests for the reviewer-fields gate.
+
+    Mirrors `TestCompleteTaskIntegration` but targets the reviewer-
+    fields wiring specifically — these would catch a regression where
+    we forget to pass `body` or `result` into `verify_reviewer_fields`.
+    """
+
+    @pytest.fixture
+    def tony_running_task(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        # started_at well before now so floor doesn't fire
+        conn.execute(
+            "INSERT INTO tasks (id, title, body, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_rev', 'Tony review of remediation', "
+            "        'Review remediation: changes to app/api/metrics/route.ts and lib/ingest.ts', "
+            "        'running', 'tony', ?, ?, 'scratch', NULL)",
+            (now - 1000, now),
+        )
+        conn.commit()
+        yield conn
+        conn.close()
+
+    def test_tony_bare_approve_blocks_and_emits_event(
+        self, tony_running_task,
+    ) -> None:
+        with pytest.raises(kb.CompletionGateError):
+            kb.complete_task(
+                tony_running_task, "t_rev",
+                summary="approved", result="verdict: approve",
+            )
+        events = tony_running_task.execute(
+            "SELECT kind FROM task_events WHERE task_id = 't_rev' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert events["kind"] == "completion_blocked_v6_7_gates"
+        row = tony_running_task.execute(
+            "SELECT status FROM tasks WHERE id = 't_rev'"
+        ).fetchone()
+        assert row["status"] == "running"
+
+    def test_tony_full_verdict_passes(self, tony_running_task) -> None:
+        ok = kb.complete_task(
+            tony_running_task, "t_rev",
+            summary="approved", result=_GOOD_FULL,
+        )
+        assert ok
+
+
+# =====================================================================
+# Self-review fixes for PR #12 — N1 (empty body), N2 (inline-prose
+# bypass on adversarial_pass), N6 (evidence:none in code-change context)
+# =====================================================================
+
+
+class TestReviewerFieldsSelfReviewFixes:
+    def test_empty_body_does_not_crash(self) -> None:
+        """Regression for N1: empty body used to crash splitlines()[0]
+        before the gate could surface the violation."""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="",
+            result="verdict: approve\n",
+        )
+        assert isinstance(v, MissingReviewerFieldViolation)
+
+    def test_none_body_does_not_crash(self) -> None:
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body=None,
+            result="verdict: approve\n",
+        )
+        assert isinstance(v, MissingReviewerFieldViolation)
+
+    def test_adversarial_inline_prose_bypass_rejected(self) -> None:
+        """The N2 self-review finding: an inline value of 51 chars of
+        prose used to satisfy adversarial_pass.<field>. Now requires
+        structural markers (bullet, ENV_VAR:, path, file extension)."""
+        prose_verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars: see above explanation about general env safety
+  request_inputs: handled with care, full coverage everywhere
+  file_paths: standard set of paths, all are looked after
+  external_io: same as above, addressed in prior commit
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=prose_verdict,
+        )
+        assert v is not None
+        for f in (
+            "adversarial_pass.env_vars",
+            "adversarial_pass.request_inputs",
+            "adversarial_pass.file_paths",
+            "adversarial_pass.external_io",
+        ):
+            assert f in v.missing_fields, f"expected {f} in {v.missing_fields}"
+
+    def test_adversarial_structured_inline_passes(self) -> None:
+        """Inline values WITH path/env-var/extension cues pass — these
+        are honest one-line enumerations."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars: DASH_DB: allowlist enforced in lib/ingest.ts:88
+  request_inputs: route.ts:42 parses with zod schema
+  file_paths: lib/ingest.ts only opens paths under ~/.hermes/
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_evidence_none_blocked_when_body_triggers_adversarial(self) -> None:
+        """N6 self-review: ``evidence: none`` is normally an honest-
+        empty escape, but when the body indicates code-touching review
+        the reviewer MUST produce real test citations."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence: none
+
+adversarial_pass:
+  env_vars: []
+  request_inputs: []
+  file_paths: []
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/metrics/route.ts",
+            result=verdict,
+        )
+        assert v is not None
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_evidence_none_allowed_for_pure_docs_review(self) -> None:
+        """The escape stays valid for non-code reviews."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable: docs reshuffle, no entrypoints
+  evidence: none
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the README rewrite",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_prose_padded_with_readme_md_rejected(self) -> None:
+        """Second self-review found that the structure check accepted
+        prose that name-dropped README.md / config.yaml. After dropping
+        docs extensions from the source-file alternation, this bypass
+        is closed."""
+        prose_padding = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars: see README.md elsewhere for general environment safety guidance
+  request_inputs: discussed in config.yaml above; nothing concrete here either
+  file_paths: notes.md handles the overview; we're broadly compliant
+  external_io: handled per docs.json conventions across the codebase
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=prose_padding,
+        )
+        assert v is not None
+        for f in (
+            "adversarial_pass.env_vars",
+            "adversarial_pass.request_inputs",
+            "adversarial_pass.file_paths",
+            "adversarial_pass.external_io",
+        ):
+            assert f in v.missing_fields, (
+                f"expected {f} in {v.missing_fields} — README.md / config.yaml "
+                "prose name-drop should not satisfy the gate"
+            )
+
+    def test_real_yaml_path_with_slash_still_passes(self) -> None:
+        """Honest yaml/json/md mentions inside a real path (e.g.
+        ``configs/app.yaml``) still satisfy the path-with-slash regex."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/foo.test.ts:1 covers app/api/route.ts:GET
+
+adversarial_pass:
+  env_vars:
+    - configs/env.example: bounds in lib/ingest.ts
+  request_inputs:
+    - schemas/inputs.yaml validated at app/api/route.ts:42
+  file_paths:
+    - lib/ingest.ts only opens paths under ~/.hermes/
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/route.ts",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_adversarial_bullet_list_passes(self) -> None:
+        """The most common honest shape: bullet list under each section."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/integration.test.ts:42 invokes route.ts:GET
+
+adversarial_pass:
+  env_vars:
+    - DASH_DB
+    - HERMES_KANBAN_DB
+  request_inputs:
+    - none
+  file_paths:
+    - lib/ingest.ts paths only
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review app/api/metrics changes",
+            result=verdict,
+        )
+        assert v is None
