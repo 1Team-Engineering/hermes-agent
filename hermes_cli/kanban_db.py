@@ -4922,35 +4922,68 @@ def _v6_7_count_integrative_reviews(
     return int(row["c"]) if row else 0
 
 
+def _v6_7_walk_descendants(
+    conn: sqlite3.Connection, umbrella_id: str,
+) -> list:
+    """Return all transitive descendants of ``umbrella_id`` via
+    ``task_links``. Cycle-safe (visited set prevents infinite loop on
+    malformed graphs). Self-excluded.
+
+    Returns rows with id/status/assignee/title columns. Order is
+    breadth-first from umbrella; callers shouldn't rely on a specific
+    order beyond that.
+
+    Closes hermes-jarvis#73. Replaces the previous direct-children-only
+    walk which failed to fire on the common chained shape:
+    ``umbrella → A → B-review`` (per-block reviews chained off the
+    build task rather than fanned out from umbrella).
+    """
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id
+              FROM task_links l
+              JOIN descendants d ON l.parent_id = d.id
+        )
+        SELECT t.id, t.status, t.assignee, t.title
+          FROM tasks t
+          JOIN descendants d ON d.id = t.id
+        """,
+        (umbrella_id,),
+    ).fetchall()
+    return list(rows)
+
+
 def _v6_7_should_spawn_integrative_review(
     conn: sqlite3.Connection, umbrella_id: str,
 ) -> bool:
     """True if the umbrella looks like a JARVIS goal-mode chain whose
-    per-block children are all terminal and either no integrative
-    review exists yet, OR the latest one was rejected (re-spawn).
+    per-block work is all terminal and either no integrative review
+    exists yet, OR the latest one was rejected (re-spawn).
     Conservative — fires only when ALL of:
 
     1. Umbrella is ``goal_mode=True`` (JARVIS keep_running chain)
-    2. Has ≥1 child via task_links
-    3. Every non-review child is in {done, archived} (NOT blocked)
-    4. ≥1 review-role child exists (no point integrating over a chain
-       with no per-block reviews)
-    5. ≥1 non-review child exists (don't fire on review-only chains)
+    2. Has ≥1 transitive descendant via ``task_links``
+    3. Every non-review descendant is in {done, archived} (NOT blocked)
+    4. ≥1 review-role descendant exists (no point integrating over a
+       chain with no per-block reviews)
+    5. ≥1 non-review descendant exists (don't fire on review-only chains)
     6. Either no integrative review exists yet, OR the latest one is
        done with a rejecting verdict (so a re-spawn after remediation
        is the right move)
+
+    Descendant walk uses a recursive CTE so chained shapes
+    ``umbrella → build → review`` count the review as a "child" for
+    the purpose of this gate. Closes hermes-jarvis#73.
     """
     row = conn.execute(
         "SELECT goal_mode FROM tasks WHERE id = ?", (umbrella_id,),
     ).fetchone()
     if row is None or not row["goal_mode"]:
         return False
-    children = conn.execute(
-        "SELECT t.id, t.status, t.assignee, t.title "
-        "  FROM tasks t JOIN task_links l ON l.child_id = t.id "
-        " WHERE l.parent_id = ?",
-        (umbrella_id,),
-    ).fetchall()
+    children = _v6_7_walk_descendants(conn, umbrella_id)
     if not children:
         return False
     terminal_statuses = {"done", "archived"}  # blocked is NOT terminal

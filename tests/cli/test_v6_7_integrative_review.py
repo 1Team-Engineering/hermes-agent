@@ -523,3 +523,114 @@ class TestFakeReviewMitigation:
         ).fetchone()
         assert real_rev is not None
         assert real_rev["id"] != "t_fake_rev"
+
+
+# =====================================================================
+# hermes-jarvis#73 — transitive descendant walk
+# =====================================================================
+
+
+class TestTransitiveDescendantWalk:
+    """The v6.7 validation chain (2026-06-10) revealed that the gate
+    only walked direct children of the umbrella, missing chained
+    shapes like ``umbrella → build → review`` where the review's
+    parent is the build task (not the umbrella).
+
+    These tests pin the transitive walk behavior across common shapes.
+    """
+
+    def test_chained_shape_triggers_spawn(self, board_conn) -> None:
+        """The v6.7 validation case: ``umbrella → pepper → friday →
+        tony → tchalla`` — each task's parent is the previous task,
+        not the umbrella. Should still trigger #30 because tony and
+        tchalla ARE descendants."""
+        _mk_task(board_conn, "t_chain_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_chain_pepper", assignee="pepper", status="done")
+        _mk_task(board_conn, "t_chain_friday", assignee="friday", status="done")
+        _mk_task(board_conn, "t_chain_tony", assignee="tony", status="done")
+        _mk_task(board_conn, "t_chain_tchalla", assignee="tchalla", status="done")
+        # Chained edges — NOT fanned out from umbrella
+        _link(board_conn, "t_chain_umb", "t_chain_pepper")
+        _link(board_conn, "t_chain_pepper", "t_chain_friday")
+        _link(board_conn, "t_chain_friday", "t_chain_tony")
+        _link(board_conn, "t_chain_tony", "t_chain_tchalla")
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_chain_umb")
+        # Was returning True (no spawn, immediate archive) before #73 fix
+        assert ok is False
+        rev = _latest_integrative_review(board_conn, "t_chain_umb")
+        assert rev is not None
+        assert rev["status"] == "ready"
+
+    def test_fanout_shape_still_triggers_spawn(self, board_conn) -> None:
+        """The fan-out shape (direct children, original v6.7 design)
+        must continue to work — the fix should be additive."""
+        _seed_canonical_umbrella(board_conn)
+        ok = archive_task(board_conn, "t_umb")
+        assert ok is False
+        rev = _latest_integrative_review(board_conn, "t_umb")
+        assert rev is not None
+
+    def test_mixed_shape_triggers_spawn(self, board_conn) -> None:
+        """Mixed shape — some direct, some chained — also works."""
+        _mk_task(board_conn, "t_mix_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_mix_fr", assignee="friday", status="done")
+        _link(board_conn, "t_mix_umb", "t_mix_fr")
+        _mk_task(board_conn, "t_mix_tn", assignee="tony", status="done")
+        _link(board_conn, "t_mix_fr", "t_mix_tn")
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_mix_umb")
+        assert ok is False
+
+    def test_inflight_chained_descendant_blocks_spawn(self, board_conn) -> None:
+        """A non-terminal non-review descendant 3 levels deep should
+        prevent the gate from firing."""
+        _mk_task(board_conn, "t_deep_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_deep_pepper", assignee="pepper", status="done")
+        _mk_task(board_conn, "t_deep_friday", assignee="friday",
+                 status="running")  # IN FLIGHT
+        _mk_task(board_conn, "t_deep_tony", assignee="tony", status="done")
+        _link(board_conn, "t_deep_umb", "t_deep_pepper")
+        _link(board_conn, "t_deep_pepper", "t_deep_friday")
+        _link(board_conn, "t_deep_friday", "t_deep_tony")
+        board_conn.commit()
+        # Friday is still running — archive should pass through (no
+        # integrative review spawned because the build chain isn't
+        # done; matches the existing in-flight semantics).
+        ok = archive_task(board_conn, "t_deep_umb")
+        assert ok is True
+
+    def test_cyclic_links_dont_infinite_loop(self, board_conn) -> None:
+        """Defensive: a cyclic task_links graph must not infinite-loop
+        the gate. sqlite's recursive CTE handles UNION correctly so
+        cycles deduplicate automatically."""
+        _mk_task(board_conn, "t_cyc_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_cyc_a", assignee="friday", status="done")
+        _mk_task(board_conn, "t_cyc_b", assignee="tony", status="done")
+        _link(board_conn, "t_cyc_umb", "t_cyc_a")
+        _link(board_conn, "t_cyc_a", "t_cyc_b")
+        _link(board_conn, "t_cyc_b", "t_cyc_a")  # cycle: a → b → a
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_cyc_umb")
+        assert ok is False  # review spawned, no hang
+
+    def test_walk_descendants_returns_all_levels(self, board_conn) -> None:
+        """Direct unit test for _v6_7_walk_descendants helper."""
+        from hermes_cli.kanban_db import _v6_7_walk_descendants
+        _mk_task(board_conn, "t_w_root", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_w_l1", assignee="pepper", status="done")
+        _mk_task(board_conn, "t_w_l2", assignee="friday", status="done")
+        _mk_task(board_conn, "t_w_l3", assignee="tony", status="done")
+        _link(board_conn, "t_w_root", "t_w_l1")
+        _link(board_conn, "t_w_l1", "t_w_l2")
+        _link(board_conn, "t_w_l2", "t_w_l3")
+        board_conn.commit()
+        rows = _v6_7_walk_descendants(board_conn, "t_w_root")
+        ids = {r["id"] for r in rows}
+        assert ids == {"t_w_l1", "t_w_l2", "t_w_l3"}
+
+    def test_walk_descendants_empty_on_orphan(self, board_conn) -> None:
+        from hermes_cli.kanban_db import _v6_7_walk_descendants
+        _mk_task(board_conn, "t_orphan_w", goal_mode=True, status="done")
+        board_conn.commit()
+        assert _v6_7_walk_descendants(board_conn, "t_orphan_w") == []
