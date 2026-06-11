@@ -81,15 +81,45 @@ class RuntimeFloorViolation:
     completed_at: int
     floor_seconds: int
     actual_seconds: int
+    # hermes-jarvis#77/#78: how many times THIS task has already been
+    # rejected by the runtime floor. Used to escalate the error
+    # message — bare retries past N=2 become more directive so the
+    # worker stops looping and chooses an actual exit (wait OR opt
+    # out). The caller in _v6_7_run_completion_gates queries the
+    # task's prior completion_blocked_v6_7_gates events to seed this.
+    prior_floor_rejections: int = 0
+    floor_elapses_at: int = 0  # unix ts when the floor will pass
 
     def message(self) -> str:
+        seconds_remaining = max(0, self.floor_elapses_at - self.completed_at)
+        if self.prior_floor_rejections == 0:
+            return (
+                f"runtime-floor: {self.role} completed in "
+                f"{self.actual_seconds}s, below the {self.floor_seconds}s "
+                f"floor for this role. Either keep working (wait "
+                f"{seconds_remaining}s and re-call kanban_complete) or, if "
+                f"the work was genuinely trivial, set "
+                f"metadata={{\"x_fast_justified\": \"<≥20-char reason>\"}} "
+                f"on the completion call."
+            )
+        # Progressive escalation: after the first rejection, retrying
+        # with the same inputs will only be rejected again. Force the
+        # worker to actually choose: wait or opt out.
         return (
-            f"runtime-floor: {self.role} completed in {self.actual_seconds}s, "
-            f"below the {self.floor_seconds}s floor for this role. "
-            f"Either keep working (add evidence and re-call kanban_complete after "
-            f"the floor passes) or, if the work was genuinely trivial, set "
-            f"metadata={{\"x_fast_justified\": \"<one-line reason>\"}} on the "
-            f"completion call."
+            f"runtime-floor: {self.role} REJECTED FOR THE "
+            f"{self.prior_floor_rejections + 1}-th TIME — same inputs, "
+            f"same result. Bare retries will keep being rejected.\n"
+            f"You must choose ONE of:\n"
+            f"  (A) Wait {seconds_remaining}s (until the floor elapses at "
+            f"epoch {self.floor_elapses_at}), THEN call kanban_complete "
+            f"with your current verdict — heartbeat in the meantime, "
+            f"don't call complete again until the floor has passed.\n"
+            f"  (B) Opt out NOW: call kanban_complete with "
+            f"metadata={{\"x_fast_justified\": \"<≥20-char reason "
+            f"explaining why the work is genuinely done in "
+            f"{self.actual_seconds}s\"}}. This is audited.\n"
+            f"Do NOT repeat the previous call verbatim — that's how "
+            f"workers burn iteration budgets."
         )
 
 
@@ -100,6 +130,7 @@ def verify_runtime_floor(
     *,
     allow_below_floor: bool = False,
     is_honest_reject: bool = False,
+    prior_floor_rejections: int = 0,
 ) -> Optional[RuntimeFloorViolation]:
     """Return a violation if the worker's runtime is below its role floor.
 
@@ -134,6 +165,8 @@ def verify_runtime_floor(
     return RuntimeFloorViolation(
         role=assignee, started_at=int(started_at), completed_at=completed_at,
         floor_seconds=floor, actual_seconds=actual,
+        prior_floor_rejections=max(0, int(prior_floor_rejections)),
+        floor_elapses_at=int(started_at) + floor,
     )
 
 

@@ -671,6 +671,14 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
+
+    v6.8 hermes-jarvis#78: when this task has a prior runtime-floor
+    rejection, the response includes ``floor_status`` with
+    ``elapses_at`` (unix ts when the floor will pass) and
+    ``retry_complete_now`` (true once the floor has elapsed). A worker
+    that was rejected for being too fast can use this to self-direct
+    between waiting and opt-ing out, rather than heartbeat-loop
+    forever past the elapsed time without re-trying completion.
     """
     tid = _default_task_id(args.get("task_id"))
     if not tid:
@@ -703,6 +711,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not heartbeat {tid} (unknown id or not running)"
                 )
+            floor_status = kb.v6_7_heartbeat_floor_status(conn, tid)
+            if floor_status is not None:
+                return _ok(task_id=tid, floor_status=floor_status)
             return _ok(task_id=tid)
         finally:
             conn.close()

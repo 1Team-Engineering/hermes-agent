@@ -3612,6 +3612,27 @@ def _validate_opt_out(task_id: str, key: str, raw) -> Optional[str]:
     return raw.strip()
 
 
+def _v6_7_count_prior_floor_rejections(
+    conn: sqlite3.Connection, task_id: str,
+) -> int:
+    """Count how many ``completion_blocked_v6_7_gates`` events for this
+    task contain a ``RuntimeFloorViolation``.
+
+    Used by ``_v6_7_run_completion_gates`` to escalate the floor-gate
+    error message after the first rejection (hermes-jarvis#77/#78).
+    The query is a substring match on the JSON payload — fast on the
+    bounded per-task event count (typically <50) and avoids a JSON
+    parse loop in the hot path.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        " WHERE task_id = ? AND kind = 'completion_blocked_v6_7_gates' "
+        "   AND payload LIKE '%RuntimeFloorViolation%'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def _v6_7_run_completion_gates(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3683,6 +3704,10 @@ def _v6_7_run_completion_gates(
     # and any future gate can use it.
     parsed_verdict = _v6_7_parse_verdict(result)
     is_honest_reject = parsed_verdict == "reject"
+    # hermes-jarvis#77: how many times this task has been rejected by
+    # the runtime floor specifically. Used to escalate the gate-error
+    # message after N=1 so workers stop looping on bare retries.
+    prior_floor_rejections = _v6_7_count_prior_floor_rejections(conn, task_id)
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
@@ -3690,6 +3715,7 @@ def _v6_7_run_completion_gates(
         completed_at=now,
         allow_below_floor=fast_ok,
         is_honest_reject=is_honest_reject,
+        prior_floor_rejections=prior_floor_rejections,
     )
     if floor is not None:
         violations.append(floor)
@@ -5722,6 +5748,79 @@ def _terminate_reclaimed_worker(
 
     info["terminated"] = not _pid_alive(pid)
     return info
+
+
+def v6_7_heartbeat_floor_status(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Return a worker-actionable summary of any pending runtime-floor
+    rejection for this task, or ``None`` when the gate hasn't fired.
+
+    Surfaces three fields to the heartbeating worker:
+
+    - ``elapses_at``: unix ts when the floor will pass. The worker can
+      tell how much longer to keep heartbeating before retrying
+      complete with the same verdict.
+    - ``seconds_remaining``: signed delta against ``now``. Negative
+      means the floor has already passed and the worker SHOULD call
+      kanban_complete now (with the same verdict it tried last time).
+    - ``retry_complete_now``: convenience boolean (``seconds_remaining
+      <= 0``). Workers that aren't sure about timestamps can branch on
+      this alone.
+
+    Closes hermes-jarvis#78. The 2026-06-10 case was Tony heartbeating
+    for 29 minutes past the floor without ever retrying — because the
+    SOUL didn't teach "after the floor passes, you call complete
+    again." Now the heartbeat itself tells the worker when.
+
+    Returns ``None`` when the latest ``completion_blocked_v6_7_gates``
+    event doesn't include a RuntimeFloorViolation — no floor rejection
+    to nudge against. Cheap path so the heartbeat hot loop isn't
+    slowed by this.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        " WHERE task_id = ? AND kind = 'completion_blocked_v6_7_gates' "
+        "   AND payload LIKE '%RuntimeFloorViolation%' "
+        " ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    floor_seconds: Optional[int] = None
+    started_at: Optional[int] = None
+    for v in payload.get("violations", []) or []:
+        if v.get("kind") != "RuntimeFloorViolation":
+            continue
+        # The dataclass message format includes "below the Xs floor".
+        # We also encoded floor_elapses_at on the violation, but the
+        # event payload doesn't currently include the full dataclass —
+        # message-string is the canonical surface. Pull started_at +
+        # floor from the tasks row + ROLE_RUNTIME_FLOORS_SECONDS.
+    task_row = conn.execute(
+        "SELECT assignee, started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task_row is None or task_row["started_at"] is None:
+        return None
+    from hermes_cli.kanban_completion_gates import ROLE_RUNTIME_FLOORS_SECONDS
+    assignee = (task_row["assignee"] or "").lower()
+    floor_seconds = ROLE_RUNTIME_FLOORS_SECONDS.get(assignee, 0)
+    if not floor_seconds:
+        return None
+    started_at = int(task_row["started_at"])
+    elapses_at = started_at + floor_seconds
+    now = int(time.time())
+    remaining = elapses_at - now
+    return {
+        "elapses_at": elapses_at,
+        "seconds_remaining": remaining,
+        "retry_complete_now": remaining <= 0,
+        "floor_seconds": floor_seconds,
+    }
 
 
 def heartbeat_worker(

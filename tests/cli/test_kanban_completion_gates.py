@@ -1761,3 +1761,264 @@ test_quality:
             )
         kinds = {type(v).__name__ for v in excinfo.value.violations}
         assert "RuntimeFloorViolation" in kinds
+
+
+# =====================================================================
+# hermes-jarvis#77 — progressive runtime-floor error escalation
+# =====================================================================
+
+
+class TestProgressiveFloorEscalation:
+    """When a worker keeps retrying the same below-floor completion,
+    the second attempt's error message escalates from option-style
+    ('Either... or...') to directive ('You must choose ONE of...').
+    This breaks the retry-loop pattern that burned Friday's 250-turn
+    iteration budget on 2026-06-10. Closes hermes-jarvis#77."""
+
+    def test_first_rejection_uses_default_message(self) -> None:
+        v = verify_runtime_floor(
+            "tony", 1000, 1020,  # 20s
+            prior_floor_rejections=0,
+        )
+        assert v is not None
+        msg = v.message()
+        assert "Either keep working" in msg
+        assert "kanban_complete" in msg
+        # Default message should NOT include the escalation language
+        assert "REJECTED FOR THE" not in msg
+
+    def test_second_rejection_escalates(self) -> None:
+        v = verify_runtime_floor(
+            "tony", 1000, 1020,
+            prior_floor_rejections=1,
+        )
+        assert v is not None
+        msg = v.message()
+        assert "REJECTED FOR THE 2-th TIME" in msg
+        assert "You must choose ONE of" in msg
+        assert "Wait" in msg
+        assert "Opt out NOW" in msg
+        assert "Do NOT repeat" in msg
+
+    def test_third_rejection_counter_advances(self) -> None:
+        v = verify_runtime_floor(
+            "tony", 1000, 1020,
+            prior_floor_rejections=2,
+        )
+        assert v is not None
+        msg = v.message()
+        assert "REJECTED FOR THE 3-th TIME" in msg
+
+    def test_floor_elapses_at_in_default_message(self) -> None:
+        """The default message includes the wait time."""
+        v = verify_runtime_floor(
+            "tony", 1000, 1030,  # 30s, 60s remaining
+            prior_floor_rejections=0,
+        )
+        assert v is not None
+        msg = v.message()
+        assert "Wait" in msg or "wait" in msg
+        # 90 - 30 = 60 seconds remaining
+        assert "60s" in msg
+
+    def test_floor_elapses_at_encoded_correctly(self) -> None:
+        v = verify_runtime_floor(
+            "tony", started_at=1000, completed_at=1020,
+        )
+        assert v is not None
+        assert v.floor_elapses_at == 1000 + 90  # tony's floor
+
+    def test_friday_progressive_for_build_role(self) -> None:
+        """Build roles also get escalation, with their 5min floor."""
+        v = verify_runtime_floor(
+            "friday", 1000, 1060,  # 60s
+            prior_floor_rejections=1,
+        )
+        assert v is not None
+        msg = v.message()
+        assert "REJECTED FOR THE 2-th TIME" in msg
+        # 300 - 60 = 240 seconds remaining
+        assert "240s" in msg
+
+
+class TestProgressiveFloorIntegration:
+    """End-to-end: a worker that calls complete twice in a row at
+    20s should see escalation on the SECOND CompletionGateError."""
+
+    @pytest.fixture
+    def tony_running_task(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO tasks (id, title, body, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_esc', 'Tony fast review', 'Review the docs', "
+            "        'running', 'tony', ?, ?, 'scratch', NULL)",
+            (now - 20, now),
+        )
+        conn.commit()
+        yield conn
+        conn.close()
+
+    def test_second_attempt_sees_escalated_message(
+        self, tony_running_task,
+    ) -> None:
+        # First attempt: bare approve, hits floor, gets rejected.
+        with pytest.raises(kb.CompletionGateError) as excinfo1:
+            kb.complete_task(
+                tony_running_task, "t_esc",
+                summary="approve", result="verdict: approve",
+            )
+        msg1 = str(excinfo1.value)
+        assert "Either keep working" in msg1
+        assert "REJECTED FOR THE" not in msg1
+
+        # Second attempt: same input. Should now see escalation.
+        with pytest.raises(kb.CompletionGateError) as excinfo2:
+            kb.complete_task(
+                tony_running_task, "t_esc",
+                summary="approve", result="verdict: approve",
+            )
+        msg2 = str(excinfo2.value)
+        assert "REJECTED FOR THE 2-th TIME" in msg2
+
+    def test_count_helper_returns_correct_number(
+        self, tony_running_task,
+    ) -> None:
+        from hermes_cli.kanban_db import _v6_7_count_prior_floor_rejections
+        assert _v6_7_count_prior_floor_rejections(tony_running_task, "t_esc") == 0
+        with pytest.raises(kb.CompletionGateError):
+            kb.complete_task(
+                tony_running_task, "t_esc",
+                summary="x", result="verdict: approve",
+            )
+        assert _v6_7_count_prior_floor_rejections(tony_running_task, "t_esc") == 1
+        with pytest.raises(kb.CompletionGateError):
+            kb.complete_task(
+                tony_running_task, "t_esc",
+                summary="x", result="verdict: approve",
+            )
+        assert _v6_7_count_prior_floor_rejections(tony_running_task, "t_esc") == 2
+
+
+# =====================================================================
+# hermes-jarvis#78 — heartbeat surfaces floor-elapsed status
+# =====================================================================
+
+
+class TestHeartbeatFloorStatus:
+    """When a worker that was rejected by the runtime floor heartbeats,
+    the response includes how long until the floor elapses and a
+    retry_complete_now hint. Closes hermes-jarvis#78."""
+
+    @pytest.fixture
+    def tony_task_with_rejection(self, tmp_path, monkeypatch):
+        """A tony task that has one prior runtime-floor rejection
+        recorded in task_events."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        # Tony started 30s ago, so 60s remaining on the 90s floor.
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_hb', 'Tony review', 'running', 'tony', ?, ?, "
+            "        'scratch', NULL)",
+            (now - 30, now),
+        )
+        with pytest.raises(kb.CompletionGateError):
+            kb.complete_task(
+                conn, "t_hb",
+                summary="approve", result="verdict: approve",
+            )
+        yield conn
+        conn.close()
+
+    def test_heartbeat_floor_status_includes_elapses_at(
+        self, tony_task_with_rejection,
+    ) -> None:
+        status = kb.v6_7_heartbeat_floor_status(
+            tony_task_with_rejection, "t_hb",
+        )
+        assert status is not None
+        assert "elapses_at" in status
+        assert "seconds_remaining" in status
+        assert "retry_complete_now" in status
+        assert "floor_seconds" in status
+        assert status["floor_seconds"] == 90
+
+    def test_heartbeat_floor_status_before_elapsed(
+        self, tony_task_with_rejection,
+    ) -> None:
+        """Tony started 30s ago, floor is 90s, so ~60s remaining."""
+        status = kb.v6_7_heartbeat_floor_status(
+            tony_task_with_rejection, "t_hb",
+        )
+        assert status["seconds_remaining"] > 0
+        assert status["retry_complete_now"] is False
+
+    def test_heartbeat_floor_status_returns_none_when_no_rejection(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A task that hasn't hit the runtime floor returns None
+        (no nudge needed)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_clean', 'no rejection', 'running', 'tony', ?, ?, "
+            "        'scratch', NULL)",
+            (now - 100, now),
+        )
+        conn.commit()
+        assert kb.v6_7_heartbeat_floor_status(conn, "t_clean") is None
+        conn.close()
+
+    def test_heartbeat_floor_status_signals_retry_when_elapsed(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """When the floor has elapsed (started_at long enough ago),
+        retry_complete_now flips to True so the worker knows to
+        stop heartbeating and call complete."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        # Started 200s ago (past 90s floor). Tony hit the gate at
+        # 5s in — well below floor at the time. Now elapsed.
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_done', 'past floor', 'running', 'tony', ?, ?, "
+            "        'scratch', NULL)",
+            (now - 200, now - 200),
+        )
+        # Forge a rejection that happened at started_at + 5
+        from hermes_cli.kanban_db import _append_event
+        with kb.write_txn(conn):
+            _append_event(
+                conn, "t_done", "completion_blocked_v6_7_gates",
+                {
+                    "violations": [{
+                        "kind": "RuntimeFloorViolation",
+                        "message": "below the 90s floor",
+                    }],
+                    "summary_preview": "approve",
+                },
+            )
+        conn.commit()
+        status = kb.v6_7_heartbeat_floor_status(conn, "t_done")
+        assert status is not None
+        assert status["seconds_remaining"] <= 0
+        assert status["retry_complete_now"] is True
+        conn.close()
