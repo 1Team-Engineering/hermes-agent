@@ -2173,7 +2173,7 @@ class TestUmbrellaReviewCoverage:
     def test_non_goal_mode_skips(self) -> None:
         from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
         v = verify_umbrella_review_coverage(
-            is_goal_mode=False, umbrella_id="t_u",
+            is_goal_mode=False, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[self._row("friday")],
         )
         assert v is None
@@ -2181,7 +2181,7 @@ class TestUmbrellaReviewCoverage:
     def test_goal_mode_with_review_descendant_passes(self) -> None:
         from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
         v = verify_umbrella_review_coverage(
-            is_goal_mode=True, umbrella_id="t_u",
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[self._row("friday"), self._row("tony")],
         )
         assert v is None
@@ -2191,7 +2191,7 @@ class TestUmbrellaReviewCoverage:
             MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
         )
         v = verify_umbrella_review_coverage(
-            is_goal_mode=True, umbrella_id="t_u",
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[self._row("friday"), self._row("pepper")],
         )
         assert isinstance(v, MissingUmbrellaReviewViolation)
@@ -2209,7 +2209,7 @@ class TestUmbrellaReviewCoverage:
             MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
         )
         v = verify_umbrella_review_coverage(
-            is_goal_mode=True, umbrella_id="t_u",
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[],
         )
         assert isinstance(v, MissingUmbrellaReviewViolation)
@@ -2219,7 +2219,7 @@ class TestUmbrellaReviewCoverage:
     def test_tchalla_descendant_satisfies_gate(self) -> None:
         from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
         v = verify_umbrella_review_coverage(
-            is_goal_mode=True, umbrella_id="t_u",
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[self._row("friday"), self._row("tchalla")],
         )
         assert v is None
@@ -2227,7 +2227,7 @@ class TestUmbrellaReviewCoverage:
     def test_vision_descendant_satisfies_gate(self) -> None:
         from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
         v = verify_umbrella_review_coverage(
-            is_goal_mode=True, umbrella_id="t_u",
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[self._row("friday"), self._row("vision")],
         )
         assert v is None
@@ -2235,9 +2235,116 @@ class TestUmbrellaReviewCoverage:
     def test_opt_out_bypasses_gate(self) -> None:
         from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
         v = verify_umbrella_review_coverage(
-            is_goal_mode=True, umbrella_id="t_u",
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
             descendants=[self._row("friday")],
             allow_no_review_needed=True,
+        )
+        assert v is None
+
+    # Scope tightening tests (self-review fix): gate applies ONLY to
+    # orchestration roles (jarvis/pepper/banner). Goal-mode workers
+    # like Friday are out of scope.
+
+    def test_friday_goal_mode_umbrella_skipped(self) -> None:
+        """A goal-mode task assigned to Friday should NOT be subject to
+        the umbrella-review gate — Friday is a worker, not an
+        orchestrator, and the review umbrella belongs to her parent."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="friday", umbrella_id="t_u",
+            descendants=[],
+        )
+        assert v is None
+
+    def test_tony_goal_mode_skipped(self) -> None:
+        """Review-role goal-mode tasks are also out of scope."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="tony", umbrella_id="t_u",
+            descendants=[],
+        )
+        assert v is None
+
+    def test_empty_assignee_skipped(self) -> None:
+        """Tasks with no assignee can't be an orchestration umbrella."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee=None, umbrella_id="t_u",
+            descendants=[],
+        )
+        assert v is None
+
+    def test_pepper_umbrella_in_scope(self) -> None:
+        """Pepper is an orchestration role — also subject to the gate."""
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="pepper", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+
+    def test_banner_umbrella_in_scope(self) -> None:
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="banner", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+
+    def test_assignee_case_insensitive(self) -> None:
+        """Assignee comparison is case-insensitive, matching the rest
+        of the gate module."""
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="JARVIS", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+
+    def test_review_in_blocked_status_still_counts(self) -> None:
+        """ANY review descendant satisfies the gate, regardless of
+        status (queued / running / blocked / done) — the gate is
+        about the *intent* to review, not the review's progress."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[
+                self._row("friday", status="done"),
+                self._row("tony", status="blocked"),
+            ],
+        )
+        assert v is None
+
+    def test_deep_transitive_review_descendant_counts(self) -> None:
+        """The transitive walk (#73) means a reviewer 4 levels deep
+        still satisfies the gate. This is a pure-function test — the
+        descendants list is already flattened by the caller."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[
+                self._row("friday", id_="t_c1"),
+                self._row("pepper", id_="t_c2"),
+                self._row("friday", id_="t_gc1"),
+                self._row("tchalla", id_="t_ggc1"),  # deep reviewer
+            ],
+        )
+        assert v is None
+
+    def test_multi_children_with_multiple_reviews_passes(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[
+                self._row("friday"), self._row("shuri"),
+                self._row("tony"), self._row("tchalla"), self._row("vision"),
+            ],
         )
         assert v is None
 
@@ -2315,7 +2422,7 @@ class TestUmbrellaReviewCoverageIntegration:
         )
         assert ok
 
-    def test_x_no_review_needed_opt_out_passes(
+    def test_x_umbrella_no_review_opt_out_passes(
         self, umbrella_with_only_build,
     ) -> None:
         """An umbrella that legitimately doesn't need review can
@@ -2324,7 +2431,7 @@ class TestUmbrellaReviewCoverageIntegration:
             umbrella_with_only_build, "t_umb",
             summary="status ack",
             result="Acknowledged upstream completion; no review needed.",
-            metadata={"x_no_review_needed":
+            metadata={"x_umbrella_no_review":
                       "pure status ack of upstream complete, no actionable subtasks"},
         )
         assert ok
@@ -2338,7 +2445,7 @@ class TestUmbrellaReviewCoverageIntegration:
             kb.complete_task(
                 umbrella_with_only_build, "t_umb",
                 summary="x", result="x",
-                metadata={"x_no_review_needed": "ok"},
+                metadata={"x_umbrella_no_review": "ok"},
             )
 
     def test_non_goal_mode_task_unaffected(

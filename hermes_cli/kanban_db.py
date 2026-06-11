@@ -3689,8 +3689,8 @@ def _v6_7_run_completion_gates(
     doc_drift_reason = _validate_opt_out(task_id, "x_doc_drift_ok", md.get("x_doc_drift_ok"))
     # hermes-jarvis#79: opt-out for goal-mode umbrellas that
     # legitimately don't need any per-block review.
-    no_review_needed_reason = _validate_opt_out(
-        task_id, "x_no_review_needed", md.get("x_no_review_needed"),
+    umbrella_no_review_reason = _validate_opt_out(
+        task_id, "x_umbrella_no_review", md.get("x_umbrella_no_review"),
     )
     accepted_opt_outs = {
         k: v for k, v in (
@@ -3700,7 +3700,7 @@ def _v6_7_run_completion_gates(
             ("x_no_reviewer_fields", no_rf_reason),
             ("x_phantom_pr_ok", phantom_ok_reason),
             ("x_doc_drift_ok", doc_drift_reason),
-            ("x_no_review_needed", no_review_needed_reason),
+            ("x_umbrella_no_review", umbrella_no_review_reason),
         ) if v is not None
     }
     if accepted_opt_outs:
@@ -3779,12 +3779,13 @@ def _v6_7_run_completion_gates(
     # _v6_7_walk_descendants from #73 — keeps the transitive-walk
     # behavior consistent across the integrative-review-at-archive
     # gate (#30) and this complete-time check.
-    no_review_needed = no_review_needed_reason is not None
+    no_review_needed = umbrella_no_review_reason is not None
     is_goal_mode = bool(row["goal_mode"])
     if is_goal_mode and not no_review_needed:
         descendants = _v6_7_walk_descendants(conn, task_id)
         umbrella_review = verify_umbrella_review_coverage(
             is_goal_mode=is_goal_mode,
+            umbrella_assignee=row["assignee"],
             umbrella_id=task_id,
             descendants=descendants,
             allow_no_review_needed=no_review_needed,
