@@ -1051,6 +1051,109 @@ def verify_doc_drift(
 
 
 # =====================================================================
+# Umbrella review-coverage gate (#79)
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class MissingUmbrellaReviewViolation:
+    umbrella_id: str
+    has_non_review_descendant: bool
+
+    def message(self) -> str:
+        if not self.has_non_review_descendant:
+            # Pathological: a goal-mode umbrella with no descendants
+            # at all. The orchestrator never decomposed.
+            return (
+                f"umbrella-review-coverage: this goal-mode umbrella "
+                f"({self.umbrella_id}) has no descendants at all. "
+                f"A `--goal` umbrella that completes without ever "
+                f"spawning child tasks is almost always a misfire — "
+                f"either decompose the work into children first, or, "
+                f"if this umbrella legitimately has no actionable "
+                f"sub-tasks, set "
+                f"metadata={{\"x_no_review_needed\": \"<≥20-char "
+                f"reason — e.g. 'pure status-only ack of upstream "
+                f"completion'>\"}}."
+            )
+        return (
+            f"umbrella-review-coverage: this goal-mode umbrella "
+            f"({self.umbrella_id}) has build-role descendants but NO "
+            f"review-role descendants (tony / tchalla / vision / "
+            f"reviewer) anywhere in its task_links subtree. "
+            f"Marvel-swarm chains call for at least one per-block "
+            f"review before the umbrella archives. Either spawn the "
+            f"review task(s) now via kanban_create (--parent <build-"
+            f"task-id> --assignee tony/tchalla/vision), THEN re-call "
+            f"kanban_complete, or — if this work genuinely doesn't "
+            f"need review (rare; usually a misfire) — set "
+            f"metadata={{\"x_no_review_needed\": \"<≥20-char "
+            f"reason>\"}}.\n"
+            f"This catches the 2026-06-10 validation case where JARVIS "
+            f"spawned Pepper+Friday and exited done without queuing "
+            f"any reviewer, leaving Kaipo to hand-spawn the rest of "
+            f"the chain. See hermes-jarvis#79."
+        )
+
+
+def verify_umbrella_review_coverage(
+    is_goal_mode: bool,
+    umbrella_id: str,
+    descendants: "list",  # rows from _v6_7_walk_descendants
+    *,
+    allow_no_review_needed: bool = False,
+) -> Optional[MissingUmbrellaReviewViolation]:
+    """Reject a goal-mode umbrella's kanban_complete if its
+    descendant subtree contains no review-role tasks.
+
+    Closes hermes-jarvis#79. The 2026-06-10 v6.7 validation chain on
+    hermes-dashboard had JARVIS spawn Pepper + Friday from the
+    umbrella, then call kanban_complete on itself before any reviewer
+    was queued. The umbrella showed as done with build-only
+    descendants; Kaipo had to manually spawn Tony / Tchalla / Vision
+    to continue the chain. This gate forces the JARVIS umbrella to
+    keep_running until at least one review task exists in its
+    subtree.
+
+    Skipped (returns None) when:
+    - The task is not goal_mode (orchestration umbrellas always run
+      with --goal; non-goal tasks don't need this discipline).
+    - At least one descendant has a review-role assignee.
+    - Opt-out via ``allow_no_review_needed=True``.
+
+    Differs from the v6.7 #30 integrative-review-at-archive gate:
+    that gate fires at ARCHIVE time and spawns Tchalla after a chain
+    settles. This gate fires at COMPLETE time and forces JARVIS to
+    spawn reviewers BEFORE marking itself done — catching the empty-
+    chain misfire one step earlier in the orchestration lifecycle.
+    """
+    if allow_no_review_needed:
+        return None
+    if not is_goal_mode:
+        return None
+    if not descendants:
+        return MissingUmbrellaReviewViolation(
+            umbrella_id=umbrella_id, has_non_review_descendant=False,
+        )
+    has_review = False
+    has_non_review = False
+    for ch in descendants:
+        assignee = (ch["assignee"] or "").lower()
+        if assignee in REVIEW_ROLES:
+            has_review = True
+        elif assignee:  # any non-empty non-review assignee
+            has_non_review = True
+    if has_review:
+        return None
+    # No review descendants — fail. Surface whether there's at least
+    # one build descendant so the message can specialize.
+    return MissingUmbrellaReviewViolation(
+        umbrella_id=umbrella_id,
+        has_non_review_descendant=has_non_review,
+    )
+
+
+# =====================================================================
 # Exception class for the integration in `complete_task`
 # =====================================================================
 
