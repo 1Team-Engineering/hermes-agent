@@ -606,10 +606,11 @@ def _has_adversarial_structure(text: str) -> bool:
 _HONEST_EMPTY_MARKERS = {"none", "[]", "{}", "n/a"}
 
 # hermes-jarvis#75: bullet form of honest-empty for test_quality.evidence.
-# The reason must be ≥8 chars (non-whitespace), mirroring the
-# ``not_applicable`` shape already accepted for imports_match.
+# The reason must be ≥8 chars (1 non-whitespace + at least 7 more
+# characters), mirroring the ``not_applicable`` shape already accepted
+# for imports_match.
 _BULLET_NOT_APPLICABLE_RE = re.compile(
-    r"(?mi)^\s*-\s*not_applicable\s*:\s*(\S.{6,})\s*$",
+    r"(?mi)^\s*-\s*not_applicable\s*:\s*(\S.{7,})\s*$",
 )
 
 

@@ -548,6 +548,10 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    # Wave A #28 hygiene gate (dispatcher enforcement)
+    hygiene_err = _enforce_kanban_complete_hygiene(tid, summary, metadata, artifacts)
+    if hygiene_err:
+        return hygiene_err
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:

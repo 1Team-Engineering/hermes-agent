@@ -1725,3 +1725,39 @@ test_quality:
                 tony_running_task, "t_rev",
                 summary="approve docs", result=good_verdict,
             )
+
+    def test_tony_fast_bare_reject_still_blocks_on_reviewer_fields(
+        self, tony_running_task,
+    ) -> None:
+        """The floor bypass for honest-reject doesn't accidentally
+        green-light no-evidence rejects. A reviewer who submits
+        `verdict: reject` in 20s with NO structured test_quality
+        fields should still trip the reviewer-fields gate. The floor
+        gate passes (because verdict is reject) but reviewer-fields
+        catches the missing discipline."""
+        with pytest.raises(kb.CompletionGateError) as excinfo:
+            kb.complete_task(
+                tony_running_task, "t_rev",
+                summary="bare reject", result="verdict: reject\n",
+            )
+        # Verify it was the REVIEWER-FIELDS gate that caught it, not
+        # the runtime-floor gate.
+        violations = excinfo.value.violations
+        kinds = {type(v).__name__ for v in violations}
+        assert "MissingReviewerFieldViolation" in kinds
+        assert "RuntimeFloorViolation" not in kinds
+
+    def test_tony_no_verdict_still_subject_to_floor(
+        self, tony_running_task,
+    ) -> None:
+        """A null verdict (no canonical `verdict: ...` line) must NOT
+        be treated as honest reject — that would let any reviewer
+        bypass the floor by simply omitting a verdict. parsed_verdict
+        is None, is_honest_reject is False, floor fires normally."""
+        with pytest.raises(kb.CompletionGateError) as excinfo:
+            kb.complete_task(
+                tony_running_task, "t_rev",
+                summary="no verdict", result="Just my thoughts, no verdict line.",
+            )
+        kinds = {type(v).__name__ for v in excinfo.value.violations}
+        assert "RuntimeFloorViolation" in kinds

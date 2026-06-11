@@ -4185,7 +4185,30 @@ def edit_completed_task_result(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> bool:
-    """Backfill the user-visible result for an already completed task."""
+    """Backfill the user-visible result for an already completed task.
+
+    .. warning::
+
+        This bypasses every v6.7/v6.8 verification gate (runtime
+        floor, workspace-diff, repo hygiene, reviewer fields,
+        adversarial pass, PR existence, doc drift, honest-reject
+        verdict parser, integrative-review-spawn). It exists for
+        human/CLI ops on a finished task (``hermes kanban edit``);
+        do NOT wire it into a worker tool surface or any agent
+        accessible path. Doing so would let a worker:
+
+        - Complete a task with a low-discipline result, then
+          re-write to a high-discipline one (or vice-versa) to
+          satisfy whatever gate ran first.
+        - Flip ``verdict: approve`` → ``verdict: reject`` after the
+          gate path already accepted the result.
+        - Insert phantom PR URLs that the gate already verified
+          against at completion time.
+
+        If you need worker access to amend a completed result, run
+        the full gate pipeline (``_v6_7_run_completion_gates``)
+        against the new content before the UPDATE.
+    """
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
