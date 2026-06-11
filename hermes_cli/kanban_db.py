@@ -91,6 +91,7 @@ from typing import Any, Iterable, Optional
 from toolsets import get_toolset_names
 
 from hermes_cli.kanban_completion_gates import (
+    ROLE_RUNTIME_FLOORS_SECONDS,
     CompletionGateError,
     verify_doc_drift,
     verify_no_stray_artifacts,
@@ -3612,6 +3613,35 @@ def _validate_opt_out(task_id: str, key: str, raw) -> Optional[str]:
     return raw.strip()
 
 
+def _v6_7_count_prior_floor_rejections(
+    conn: sqlite3.Connection, task_id: str,
+) -> int:
+    """Count how many ``completion_blocked_v6_7_gates`` events for this
+    task contain a ``RuntimeFloorViolation``.
+
+    Used by ``_v6_7_run_completion_gates`` to escalate the floor-gate
+    error message after the first rejection (hermes-jarvis#77/#78).
+    The query is a substring match anchored to the JSON ``"kind"``
+    field — fast on the bounded per-task event count (typically <50)
+    and avoids a JSON parse loop in the hot path.
+
+    Anchoring on ``"kind": "RuntimeFloorViolation"`` (with the
+    quoted-key syntax json.dumps produces) prevents false positives
+    from a worker's ``summary_preview`` that happens to mention the
+    class name in prose. The match still works against multi-violation
+    payloads (one event with both floor and reviewer-field violations
+    counts once, which is correct — a single rejection cycle is one
+    rejection).
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        " WHERE task_id = ? AND kind = 'completion_blocked_v6_7_gates' "
+        "   AND payload LIKE '%\"kind\": \"RuntimeFloorViolation\"%'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def _v6_7_run_completion_gates(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3683,6 +3713,10 @@ def _v6_7_run_completion_gates(
     # and any future gate can use it.
     parsed_verdict = _v6_7_parse_verdict(result)
     is_honest_reject = parsed_verdict == "reject"
+    # hermes-jarvis#77: how many times this task has been rejected by
+    # the runtime floor specifically. Used to escalate the gate-error
+    # message after N=1 so workers stop looping on bare retries.
+    prior_floor_rejections = _v6_7_count_prior_floor_rejections(conn, task_id)
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
@@ -3690,6 +3724,7 @@ def _v6_7_run_completion_gates(
         completed_at=now,
         allow_below_floor=fast_ok,
         is_honest_reject=is_honest_reject,
+        prior_floor_rejections=prior_floor_rejections,
     )
     if floor is not None:
         violations.append(floor)
@@ -5722,6 +5757,82 @@ def _terminate_reclaimed_worker(
 
     info["terminated"] = not _pid_alive(pid)
     return info
+
+
+def _v6_7_heartbeat_floor_status(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Return a worker-actionable summary of any pending runtime-floor
+    rejection for this task, or ``None`` when the gate hasn't fired.
+
+    Surfaces four fields to the heartbeating worker:
+
+    - ``elapses_at``: unix ts when the floor will pass. The worker can
+      tell how much longer to keep heartbeating before retrying
+      complete with the same verdict.
+    - ``seconds_remaining``: signed delta against ``now``. Negative
+      means the floor has already passed and the worker SHOULD call
+      kanban_complete now (with the same verdict it tried last time).
+    - ``retry_complete_now``: convenience boolean (``seconds_remaining
+      <= 0``). Workers that aren't sure about timestamps can branch on
+      this alone.
+    - ``floor_seconds``: the role's floor for clarity in the response.
+
+    Closes hermes-jarvis#78. The 2026-06-10 case was Tony heartbeating
+    for 29 minutes past the floor without ever retrying — because the
+    SOUL didn't teach "after the floor passes, you call complete
+    again." Now the heartbeat itself tells the worker when.
+
+    Returns ``None`` when the task has no past ``completion_blocked_
+    v6_7_gates`` event with a RuntimeFloorViolation — no floor
+    rejection to nudge against. Cheap path so the heartbeat hot loop
+    isn't slowed by this.
+
+    Note on stale events: if the task's MOST RECENT rejection was for
+    a non-floor violation (e.g., reviewer-fields), the lookup still
+    finds the older floor-rejection event and surfaces its status.
+    This is intentional — even if the latest rejection wasn't the
+    floor, knowing the floor's elapsed-by status helps the worker
+    plan ("the floor passed; fix the OTHER violation").
+
+    The exposed name has a single leading underscore so callers
+    outside this module treat it as v6.7-internal. The
+    ``kanban_heartbeat`` tool surface in ``tools/kanban_tools.py``
+    imports it explicitly.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_events "
+        " WHERE task_id = ? AND kind = 'completion_blocked_v6_7_gates' "
+        "   AND payload LIKE '%\"kind\": \"RuntimeFloorViolation\"%' "
+        " ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    task_row = conn.execute(
+        "SELECT assignee, started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task_row is None or task_row["started_at"] is None:
+        return None
+    assignee = (task_row["assignee"] or "").lower()
+    floor_seconds = ROLE_RUNTIME_FLOORS_SECONDS.get(assignee, 0)
+    if not floor_seconds:
+        return None
+    started_at = int(task_row["started_at"])
+    elapses_at = started_at + floor_seconds
+    now = int(time.time())
+    remaining = elapses_at - now
+    return {
+        "elapses_at": elapses_at,
+        "seconds_remaining": remaining,
+        "retry_complete_now": remaining <= 0,
+        "floor_seconds": floor_seconds,
+    }
+
+
+# Alias for the prior public-named symbol so external imports keep
+# working — internal callers should prefer the underscore form.
+v6_7_heartbeat_floor_status = _v6_7_heartbeat_floor_status
 
 
 def heartbeat_worker(
