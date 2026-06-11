@@ -106,8 +106,8 @@ class RuntimeFloorViolation:
         # with the same inputs will only be rejected again. Force the
         # worker to actually choose: wait or opt out.
         return (
-            f"runtime-floor: {self.role} REJECTED FOR THE "
-            f"{self.prior_floor_rejections + 1}-th TIME — same inputs, "
+            f"runtime-floor: {self.role} REJECTED #"
+            f"{self.prior_floor_rejections + 1} — same inputs, "
             f"same result. Bare retries will keep being rejected.\n"
             f"You must choose ONE of:\n"
             f"  (A) Wait {seconds_remaining}s (until the floor elapses at "
@@ -135,8 +135,20 @@ def verify_runtime_floor(
     """Return a violation if the worker's runtime is below its role floor.
 
     ``started_at`` is the timestamp the dispatcher recorded when the worker
-    claimed the task (NOT the run-row creation time). ``completed_at`` is
-    "now" from the dispatcher's perspective when ``complete_task`` runs.
+    FIRST claimed the task (set once via ``COALESCE`` in ``claim_task``;
+    NOT updated on reclaim). ``completed_at`` is "now" from the
+    dispatcher's perspective when ``complete_task`` runs.
+
+    **Reclaim semantics**: the floor is anchored to task LIFETIME, not
+    to the current attempt's runtime. After a reclaim, ``actual`` is
+    measured from the original ``started_at``, so a second-attempt
+    worker that completes 5s after claiming may pass the floor if
+    enough lifetime has elapsed since the first attempt. The floor
+    was designed to catch fabrication in the FIRST attempt
+    specifically; a reclaim usually means the chain has been at it
+    for a while, and the discipline already applied to the first
+    attempt. If this becomes a real problem, switch to
+    ``task_runs.started_at`` for the current run.
 
     A floor of 0 (or an unknown assignee, or a missing ``started_at``) is a
     pass — we never invent floors for roles we don't know.
@@ -148,6 +160,10 @@ def verify_runtime_floor(
     rubber-stamp-approve, neither of which is good. Build/orchestration
     roles get no bypass — a 60-second "implementation" that ends in
     reject still warrants the floor.
+
+    ``prior_floor_rejections`` (hermes-jarvis#77) seeds the
+    progressive escalation in ``RuntimeFloorViolation.message()`` so
+    bare retries past the first rejection get a more directive error.
     """
     if allow_below_floor:
         return None

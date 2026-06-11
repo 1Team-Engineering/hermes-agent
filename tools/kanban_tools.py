@@ -711,7 +711,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not heartbeat {tid} (unknown id or not running)"
                 )
-            floor_status = kb.v6_7_heartbeat_floor_status(conn, tid)
+            floor_status = kb._v6_7_heartbeat_floor_status(conn, tid)
             if floor_status is not None:
                 return _ok(task_id=tid, floor_status=floor_status)
             return _ok(task_id=tid)

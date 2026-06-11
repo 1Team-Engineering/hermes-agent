@@ -1785,7 +1785,7 @@ class TestProgressiveFloorEscalation:
         assert "Either keep working" in msg
         assert "kanban_complete" in msg
         # Default message should NOT include the escalation language
-        assert "REJECTED FOR THE" not in msg
+        assert "REJECTED #" not in msg
 
     def test_second_rejection_escalates(self) -> None:
         v = verify_runtime_floor(
@@ -1794,7 +1794,7 @@ class TestProgressiveFloorEscalation:
         )
         assert v is not None
         msg = v.message()
-        assert "REJECTED FOR THE 2-th TIME" in msg
+        assert "REJECTED #2" in msg
         assert "You must choose ONE of" in msg
         assert "Wait" in msg
         assert "Opt out NOW" in msg
@@ -1807,7 +1807,7 @@ class TestProgressiveFloorEscalation:
         )
         assert v is not None
         msg = v.message()
-        assert "REJECTED FOR THE 3-th TIME" in msg
+        assert "REJECTED #3" in msg
 
     def test_floor_elapses_at_in_default_message(self) -> None:
         """The default message includes the wait time."""
@@ -1836,7 +1836,7 @@ class TestProgressiveFloorEscalation:
         )
         assert v is not None
         msg = v.message()
-        assert "REJECTED FOR THE 2-th TIME" in msg
+        assert "REJECTED #2" in msg
         # 300 - 60 = 240 seconds remaining
         assert "240s" in msg
 
@@ -1874,7 +1874,7 @@ class TestProgressiveFloorIntegration:
             )
         msg1 = str(excinfo1.value)
         assert "Either keep working" in msg1
-        assert "REJECTED FOR THE" not in msg1
+        assert "REJECTED #" not in msg1
 
         # Second attempt: same input. Should now see escalation.
         with pytest.raises(kb.CompletionGateError) as excinfo2:
@@ -1883,7 +1883,7 @@ class TestProgressiveFloorIntegration:
                 summary="approve", result="verdict: approve",
             )
         msg2 = str(excinfo2.value)
-        assert "REJECTED FOR THE 2-th TIME" in msg2
+        assert "REJECTED #2" in msg2
 
     def test_count_helper_returns_correct_number(
         self, tony_running_task,
@@ -2022,3 +2022,133 @@ class TestHeartbeatFloorStatus:
         assert status["seconds_remaining"] <= 0
         assert status["retry_complete_now"] is True
         conn.close()
+
+
+# =====================================================================
+# Self-review gap-fills for v6.8 Part 3
+# =====================================================================
+
+
+class TestProgressiveFloorSelfReviewGaps:
+    """Cases the second-pass review flagged as missing coverage.
+
+    Closes the LIKE-pattern false-positive surface, the multi-violation
+    payload behavior, unknown-task safety, and the negative-seconds-
+    remaining branch of the escalated message.
+    """
+
+    def test_summary_with_class_name_does_not_inflate_counter(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A worker whose summary literally contains 'RuntimeFloorViolation'
+        (e.g. a post-mortem note quoting prior errors) must NOT
+        inflate the prior_floor_rejections counter. The LIKE pattern
+        now anchors to the JSON ``"kind":"RuntimeFloorViolation"``
+        field, not the bare word."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        from hermes_cli.kanban_db import (
+            _v6_7_count_prior_floor_rejections, _append_event, write_txn,
+        )
+        # Insert a fake "completion_blocked_v6_7_gates" event whose
+        # payload contains the word RuntimeFloorViolation in
+        # summary_preview but NOT in a "kind":"RuntimeFloorViolation"
+        # JSON field — simulates a worker summary that mentions the
+        # error text in prose.
+        import time
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_fp', 'fp', 'running', 'tony', ?, ?, 'scratch', NULL)",
+            (now, now),
+        )
+        with write_txn(conn):
+            _append_event(
+                conn, "t_fp", "completion_blocked_v6_7_gates",
+                {
+                    "violations": [{
+                        "kind": "MissingReviewerFieldViolation",
+                        "message": "reviewer-fields missing",
+                    }],
+                    "summary_preview":
+                        "Acknowledged the prior RuntimeFloorViolation; "
+                        "now fixing the test_quality fields",
+                },
+            )
+        conn.commit()
+        # Even though the payload mentions the class name in
+        # summary_preview, the anchored LIKE shouldn't match.
+        assert _v6_7_count_prior_floor_rejections(conn, "t_fp") == 0
+        conn.close()
+
+    def test_multi_violation_event_counts_once(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """An event with BOTH a RuntimeFloorViolation AND another
+        violation kind should count as ONE floor rejection (a single
+        rejection cycle is one rejection, not two)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        from hermes_cli.kanban_db import (
+            _v6_7_count_prior_floor_rejections, _append_event, write_txn,
+        )
+        import time
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_multi', 'multi', 'running', 'tony', ?, ?, 'scratch', NULL)",
+            (now, now),
+        )
+        with write_txn(conn):
+            _append_event(
+                conn, "t_multi", "completion_blocked_v6_7_gates",
+                {
+                    "violations": [
+                        {"kind": "RuntimeFloorViolation", "message": "x"},
+                        {"kind": "MissingReviewerFieldViolation", "message": "y"},
+                    ],
+                    "summary_preview": "approve",
+                },
+            )
+        conn.commit()
+        assert _v6_7_count_prior_floor_rejections(conn, "t_multi") == 1
+        conn.close()
+
+    def test_count_on_unknown_task_returns_zero(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        from hermes_cli.kanban_db import _v6_7_count_prior_floor_rejections
+        assert _v6_7_count_prior_floor_rejections(conn, "t_nonexistent") == 0
+        conn.close()
+
+    def test_escalated_message_clamps_negative_seconds_remaining(
+        self,
+    ) -> None:
+        """When the message renders AFTER the floor has elapsed (rare
+        but possible for stale rejections), seconds_remaining clamps
+        to 0 — message should NOT show a negative number."""
+        v = verify_runtime_floor(
+            "tony", started_at=1000, completed_at=1200,  # 200s elapsed (>90s floor)
+            prior_floor_rejections=1,
+        )
+        # Past-floor completion doesn't violate, but force the
+        # violation case with the dataclass directly to test the
+        # message branch.
+        from hermes_cli.kanban_completion_gates import RuntimeFloorViolation
+        violation = RuntimeFloorViolation(
+            role="tony", started_at=1000, completed_at=1095,  # 95s, past 90s floor
+            floor_seconds=90, actual_seconds=95,
+            prior_floor_rejections=1,
+            floor_elapses_at=1090,  # past the completed_at by 5s
+        )
+        msg = violation.message()
+        # Should read "Wait 0s", not "Wait -5s"
+        assert "Wait 0s" in msg or "Wait 0 " in msg
+        assert "-" not in msg.split("Wait")[1].split("s")[0]
