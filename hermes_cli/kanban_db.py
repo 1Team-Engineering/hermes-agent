@@ -3678,12 +3678,18 @@ def _v6_7_run_completion_gates(
     no_reviewer_fields = no_rf_reason is not None
     phantom_ok = phantom_ok_reason is not None
     doc_drift_ok = doc_drift_reason is not None
+    # hermes-jarvis#74: honest-reject completion bypasses the floor for
+    # reviewers. Parsing the verdict here once so both the floor gate
+    # and any future gate can use it.
+    parsed_verdict = _v6_7_parse_verdict(result)
+    is_honest_reject = parsed_verdict == "reject"
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
         started_at=row["started_at"],
         completed_at=now,
         allow_below_floor=fast_ok,
+        is_honest_reject=is_honest_reject,
     )
     if floor is not None:
         violations.append(floor)
@@ -4179,7 +4185,30 @@ def edit_completed_task_result(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> bool:
-    """Backfill the user-visible result for an already completed task."""
+    """Backfill the user-visible result for an already completed task.
+
+    .. warning::
+
+        This bypasses every v6.7/v6.8 verification gate (runtime
+        floor, workspace-diff, repo hygiene, reviewer fields,
+        adversarial pass, PR existence, doc drift, honest-reject
+        verdict parser, integrative-review-spawn). It exists for
+        human/CLI ops on a finished task (``hermes kanban edit``);
+        do NOT wire it into a worker tool surface or any agent
+        accessible path. Doing so would let a worker:
+
+        - Complete a task with a low-discipline result, then
+          re-write to a high-discipline one (or vice-versa) to
+          satisfy whatever gate ran first.
+        - Flip ``verdict: approve`` → ``verdict: reject`` after the
+          gate path already accepted the result.
+        - Insert phantom PR URLs that the gate already verified
+          against at completion time.
+
+        If you need worker access to amend a completed result, run
+        the full gate pipeline (``_v6_7_run_completion_gates``)
+        against the new content before the UPDATE.
+    """
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(

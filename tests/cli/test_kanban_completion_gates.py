@@ -90,6 +90,64 @@ class TestRuntimeFloor:
         v = verify_runtime_floor("Tony", 1000, 1020)
         assert v is not None
 
+    # === hermes-jarvis#74 — honest-reject bypass ===
+
+    def test_honest_reject_bypasses_floor_for_tony(self) -> None:
+        """The exact 2026-06-10 case: Tony correctly identified bugs in
+        20s, verdict was reject, but the 90s floor blocked the
+        completion 6+ times. Now honest reject bypasses the floor."""
+        v = verify_runtime_floor(
+            "tony", 1000, 1020,  # 20s, way under 90s floor
+            is_honest_reject=True,
+        )
+        assert v is None
+
+    def test_honest_reject_bypasses_floor_for_tchalla(self) -> None:
+        v = verify_runtime_floor(
+            "tchalla", 1000, 1015,
+            is_honest_reject=True,
+        )
+        assert v is None
+
+    def test_honest_reject_bypasses_floor_for_vision(self) -> None:
+        v = verify_runtime_floor(
+            "vision", 1000, 1015,
+            is_honest_reject=True,
+        )
+        assert v is None
+
+    def test_approve_under_floor_still_rejects(self) -> None:
+        """The floor is designed against rubber-stamp APPROVES.
+        is_honest_reject=False (verdict is approve / no verdict / etc.)
+        must NOT bypass."""
+        v = verify_runtime_floor(
+            "tony", 1000, 1020,
+            is_honest_reject=False,
+        )
+        assert v is not None
+        assert v.floor_seconds == 90
+
+    def test_honest_reject_does_NOT_bypass_floor_for_build_role(self) -> None:
+        """The bypass is reviewer-scoped. A friday/shuri 60-second
+        'implementation' that ends in reject still warrants the
+        5-minute floor — a fast reject from a build role isn't a sign
+        of work done, just of work bailed on."""
+        v = verify_runtime_floor(
+            "friday", 1000, 1060,  # 60s, way under 5min floor
+            is_honest_reject=True,
+        )
+        assert v is not None
+        assert v.floor_seconds == 300
+
+    def test_honest_reject_with_unknown_role_still_passes(self) -> None:
+        """Unknown roles already have no floor; the bypass changes
+        nothing."""
+        v = verify_runtime_floor(
+            "rando-profile", 1000, 1010,
+            is_honest_reject=True,
+        )
+        assert v is None
+
 
 # =====================================================================
 # verify_workspace_diff — #62
@@ -1454,3 +1512,252 @@ class TestPRExistenceErrorClassification:
             "See [PR #42](https://github.com/o/r/pull/42) for details"
         )
         assert urls == ["https://github.com/o/r/pull/42"]
+
+
+# =====================================================================
+# hermes-jarvis#75 — bullet `not_applicable: <reason>` for evidence
+# =====================================================================
+
+
+class TestBulletNotApplicableEvidence:
+    """The exact 2026-06-10 validation case: Tony wrote
+    `evidence:\\n    - not_applicable: no tests directory...` declaring
+    honestly that no tests existed. The regex only accepted inline
+    `evidence: none` so verbose-but-correct form was rejected. Closes
+    hermes-jarvis#75."""
+
+    def test_bullet_not_applicable_accepted_on_docs_review(self) -> None:
+        """The Tony-2026-06-10 case: bullet `not_applicable: <reason>`
+        passes when body doesn't trigger code_change_context."""
+        verdict = """\
+verdict: reject
+
+test_quality:
+  imports_match_deliverable_entrypoints: false
+  evidence:
+    - not_applicable: no tests directory or *.test.* files reference swarm status
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the Friday widget deliverable",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_bullet_not_applicable_blocked_on_code_review(self) -> None:
+        """For code-touching reviews (body triggers adversarial),
+        evidence honest-empty escapes are NOT accepted — same rule
+        already applied to inline `evidence: none`."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - not_applicable: no tests for this route handler
+
+adversarial_pass:
+  env_vars: []
+  request_inputs: []
+  file_paths: []
+  external_io: []
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to app/api/metrics/route.ts",
+            result=verdict,
+        )
+        assert v is not None
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_bullet_not_applicable_with_short_reason_rejected(self) -> None:
+        """Reason must be ≥8 chars (matching the existing imports_match
+        not_applicable rule). Short reasons should be rejected so
+        workers don't bypass with `not_applicable: ok`."""
+        verdict = """\
+verdict: reject
+
+test_quality:
+  imports_match_deliverable_entrypoints: false
+  evidence:
+    - not_applicable: ok
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the deliverable",
+            result=verdict,
+        )
+        assert v is not None
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_bullet_not_applicable_with_empty_reason_rejected(self) -> None:
+        verdict = """\
+verdict: reject
+
+test_quality:
+  imports_match_deliverable_entrypoints: false
+  evidence:
+    - not_applicable:
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the deliverable",
+            result=verdict,
+        )
+        assert v is not None
+        assert "test_quality.evidence" in v.missing_fields
+
+    def test_real_citations_still_pass(self) -> None:
+        """Backwards-compat: a real bullet-list of citations still
+        passes (the canonical happy path)."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/integration.test.ts:42 calls app/api/metrics/route.ts:GET
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review changes to lib/foo.ts",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_inline_evidence_none_still_works(self) -> None:
+        """Backwards-compat: inline `evidence: none` (the original
+        honest-empty form) continues to work on non-code reviews."""
+        verdict = """\
+verdict: reject
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable: pure docs reshuffle
+  evidence: none
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the README rewrite",
+            result=verdict,
+        )
+        assert v is None
+
+    def test_bullet_with_other_bullets_still_accepted(self) -> None:
+        """A reviewer who lists 2 real citations AND one
+        not_applicable bullet should still pass — the not_applicable
+        is the escape hatch, not a requirement."""
+        verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: true
+  evidence:
+    - tests/integration.test.ts:42 calls lib/foo.ts:bar
+    - tests/unit.test.ts:88 covers lib/foo.ts:baz
+"""
+        v = verify_reviewer_fields(
+            assignee="tony",
+            body="Review the deliverable",
+            result=verdict,
+        )
+        assert v is None
+
+
+# =====================================================================
+# hermes-jarvis#74 — honest-reject floor bypass (integration)
+# =====================================================================
+
+
+class TestHonestRejectIntegration:
+    """End-to-end through complete_task: a reviewer who completes fast
+    with `verdict: reject` should not trip the runtime-floor gate."""
+
+    @pytest.fixture
+    def tony_running_task(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        # started_at = now-20s, way under the 90s reviewer floor
+        conn.execute(
+            "INSERT INTO tasks (id, title, body, status, assignee, started_at, "
+            "  created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_rev', 'Tony fast review', 'Review the docs reshuffle', "
+            "        'running', 'tony', ?, ?, 'scratch', NULL)",
+            (now - 20, now),
+        )
+        conn.commit()
+        yield conn
+        conn.close()
+
+    def test_tony_fast_reject_passes_floor(self, tony_running_task) -> None:
+        """The 2026-06-10 case end-to-end: Tony submits a structured
+        reject in 20s. Old behavior: rejected by floor. New: accepted."""
+        verdict = """\
+verdict: reject
+
+test_quality:
+  imports_match_deliverable_entrypoints: false
+  evidence:
+    - not_applicable: docs-only review, no tests cover the deliverable
+"""
+        ok = kb.complete_task(
+            tony_running_task, "t_rev",
+            summary="reject — docs review", result=verdict,
+        )
+        assert ok
+
+    def test_tony_fast_approve_still_blocked_by_floor(
+        self, tony_running_task,
+    ) -> None:
+        """The other half of the bypass: approves still need the floor
+        (rubber-stamp protection unchanged)."""
+        good_verdict = """\
+verdict: approve
+
+test_quality:
+  imports_match_deliverable_entrypoints: not_applicable: pure docs
+  evidence: none
+"""
+        with pytest.raises(kb.CompletionGateError):
+            kb.complete_task(
+                tony_running_task, "t_rev",
+                summary="approve docs", result=good_verdict,
+            )
+
+    def test_tony_fast_bare_reject_still_blocks_on_reviewer_fields(
+        self, tony_running_task,
+    ) -> None:
+        """The floor bypass for honest-reject doesn't accidentally
+        green-light no-evidence rejects. A reviewer who submits
+        `verdict: reject` in 20s with NO structured test_quality
+        fields should still trip the reviewer-fields gate. The floor
+        gate passes (because verdict is reject) but reviewer-fields
+        catches the missing discipline."""
+        with pytest.raises(kb.CompletionGateError) as excinfo:
+            kb.complete_task(
+                tony_running_task, "t_rev",
+                summary="bare reject", result="verdict: reject\n",
+            )
+        # Verify it was the REVIEWER-FIELDS gate that caught it, not
+        # the runtime-floor gate.
+        violations = excinfo.value.violations
+        kinds = {type(v).__name__ for v in violations}
+        assert "MissingReviewerFieldViolation" in kinds
+        assert "RuntimeFloorViolation" not in kinds
+
+    def test_tony_no_verdict_still_subject_to_floor(
+        self, tony_running_task,
+    ) -> None:
+        """A null verdict (no canonical `verdict: ...` line) must NOT
+        be treated as honest reject — that would let any reviewer
+        bypass the floor by simply omitting a verdict. parsed_verdict
+        is None, is_honest_reject is False, floor fires normally."""
+        with pytest.raises(kb.CompletionGateError) as excinfo:
+            kb.complete_task(
+                tony_running_task, "t_rev",
+                summary="no verdict", result="Just my thoughts, no verdict line.",
+            )
+        kinds = {type(v).__name__ for v in excinfo.value.violations}
+        assert "RuntimeFloorViolation" in kinds
