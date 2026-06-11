@@ -4924,17 +4924,28 @@ def _v6_7_count_integrative_reviews(
 
 def _v6_7_walk_descendants(
     conn: sqlite3.Connection, umbrella_id: str,
-) -> list:
+) -> list[sqlite3.Row]:
     """Return all transitive descendants of ``umbrella_id`` via
-    ``task_links``. Cycle-safe (visited set prevents infinite loop on
-    malformed graphs). Self-excluded.
+    ``task_links``. Self-excluded.
 
-    Returns rows with id/status/assignee/title columns. Order is
-    breadth-first from umbrella; callers shouldn't rely on a specific
-    order beyond that.
+    Cycle-safe via SQL ``UNION`` dedup in the recursive CTE's working
+    table (sqlite stops adding rows already present). Defensive only —
+    ``link_tasks`` rejects cycles at insert time so production data
+    shouldn't have any.
 
-    Closes hermes-jarvis#73. Replaces the previous direct-children-only
-    walk which failed to fire on the common chained shape:
+    Returns rows with id/status/assignee/title columns. Callers
+    shouldn't rely on a specific order.
+
+    Multi-parent caveat: the schema allows a task to have multiple
+    parents (``task_links`` PK is ``(parent_id, child_id)``, not
+    ``child_id``-unique). If a descendant of this umbrella is ALSO a
+    descendant of another umbrella, walking from either id returns
+    the shared descendant. Gate decisions about non-terminal status
+    therefore intersect across umbrellas — acceptable since real
+    chains don't share live descendants across distinct umbrellas.
+
+    Closes hermes-jarvis#73. Replaces the previous direct-children-
+    only walk which failed to fire on the common chained shape:
     ``umbrella → A → B-review`` (per-block reviews chained off the
     build task rather than fanned out from umbrella).
     """
