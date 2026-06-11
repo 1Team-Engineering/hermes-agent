@@ -523,3 +523,196 @@ class TestFakeReviewMitigation:
         ).fetchone()
         assert real_rev is not None
         assert real_rev["id"] != "t_fake_rev"
+
+
+# =====================================================================
+# hermes-jarvis#73 — transitive descendant walk
+# =====================================================================
+
+
+class TestTransitiveDescendantWalk:
+    """The v6.7 validation chain (2026-06-10) revealed that the gate
+    only walked direct children of the umbrella, missing chained
+    shapes like ``umbrella → build → review`` where the review's
+    parent is the build task (not the umbrella).
+
+    These tests pin the transitive walk behavior across common shapes.
+    """
+
+    def test_chained_shape_triggers_spawn(self, board_conn) -> None:
+        """The v6.7 validation case: ``umbrella → pepper → friday →
+        tony → tchalla`` — each task's parent is the previous task,
+        not the umbrella. Should still trigger #30 because tony and
+        tchalla ARE descendants."""
+        _mk_task(board_conn, "t_chain_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_chain_pepper", assignee="pepper", status="done")
+        _mk_task(board_conn, "t_chain_friday", assignee="friday", status="done")
+        _mk_task(board_conn, "t_chain_tony", assignee="tony", status="done")
+        _mk_task(board_conn, "t_chain_tchalla", assignee="tchalla", status="done")
+        # Chained edges — NOT fanned out from umbrella
+        _link(board_conn, "t_chain_umb", "t_chain_pepper")
+        _link(board_conn, "t_chain_pepper", "t_chain_friday")
+        _link(board_conn, "t_chain_friday", "t_chain_tony")
+        _link(board_conn, "t_chain_tony", "t_chain_tchalla")
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_chain_umb")
+        # Was returning True (no spawn, immediate archive) before #73 fix
+        assert ok is False
+        rev = _latest_integrative_review(board_conn, "t_chain_umb")
+        assert rev is not None
+        assert rev["status"] == "ready"
+
+    def test_fanout_shape_still_triggers_spawn(self, board_conn) -> None:
+        """The fan-out shape (direct children, original v6.7 design)
+        must continue to work — the fix should be additive."""
+        _seed_canonical_umbrella(board_conn)
+        ok = archive_task(board_conn, "t_umb")
+        assert ok is False
+        rev = _latest_integrative_review(board_conn, "t_umb")
+        assert rev is not None
+
+    def test_mixed_shape_triggers_spawn(self, board_conn) -> None:
+        """Mixed shape — some direct, some chained — also works."""
+        _mk_task(board_conn, "t_mix_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_mix_fr", assignee="friday", status="done")
+        _link(board_conn, "t_mix_umb", "t_mix_fr")
+        _mk_task(board_conn, "t_mix_tn", assignee="tony", status="done")
+        _link(board_conn, "t_mix_fr", "t_mix_tn")
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_mix_umb")
+        assert ok is False
+
+    def test_inflight_chained_descendant_blocks_spawn(self, board_conn) -> None:
+        """A non-terminal non-review descendant 3 levels deep should
+        prevent the gate from firing."""
+        _mk_task(board_conn, "t_deep_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_deep_pepper", assignee="pepper", status="done")
+        _mk_task(board_conn, "t_deep_friday", assignee="friday",
+                 status="running")  # IN FLIGHT
+        _mk_task(board_conn, "t_deep_tony", assignee="tony", status="done")
+        _link(board_conn, "t_deep_umb", "t_deep_pepper")
+        _link(board_conn, "t_deep_pepper", "t_deep_friday")
+        _link(board_conn, "t_deep_friday", "t_deep_tony")
+        board_conn.commit()
+        # Friday is still running — archive should pass through (no
+        # integrative review spawned because the build chain isn't
+        # done; matches the existing in-flight semantics).
+        ok = archive_task(board_conn, "t_deep_umb")
+        assert ok is True
+
+    def test_cyclic_links_dont_infinite_loop(self, board_conn) -> None:
+        """Defensive: a cyclic task_links graph must not infinite-loop
+        the gate. sqlite's recursive CTE handles UNION correctly so
+        cycles deduplicate automatically."""
+        _mk_task(board_conn, "t_cyc_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_cyc_a", assignee="friday", status="done")
+        _mk_task(board_conn, "t_cyc_b", assignee="tony", status="done")
+        _link(board_conn, "t_cyc_umb", "t_cyc_a")
+        _link(board_conn, "t_cyc_a", "t_cyc_b")
+        _link(board_conn, "t_cyc_b", "t_cyc_a")  # cycle: a → b → a
+        board_conn.commit()
+        ok = archive_task(board_conn, "t_cyc_umb")
+        assert ok is False  # review spawned, no hang
+
+    def test_walk_descendants_returns_all_levels(self, board_conn) -> None:
+        """Direct unit test for _v6_7_walk_descendants helper."""
+        from hermes_cli.kanban_db import _v6_7_walk_descendants
+        _mk_task(board_conn, "t_w_root", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_w_l1", assignee="pepper", status="done")
+        _mk_task(board_conn, "t_w_l2", assignee="friday", status="done")
+        _mk_task(board_conn, "t_w_l3", assignee="tony", status="done")
+        _link(board_conn, "t_w_root", "t_w_l1")
+        _link(board_conn, "t_w_l1", "t_w_l2")
+        _link(board_conn, "t_w_l2", "t_w_l3")
+        board_conn.commit()
+        rows = _v6_7_walk_descendants(board_conn, "t_w_root")
+        ids = {r["id"] for r in rows}
+        assert ids == {"t_w_l1", "t_w_l2", "t_w_l3"}
+
+    def test_walk_descendants_empty_on_orphan(self, board_conn) -> None:
+        from hermes_cli.kanban_db import _v6_7_walk_descendants
+        _mk_task(board_conn, "t_orphan_w", goal_mode=True, status="done")
+        board_conn.commit()
+        assert _v6_7_walk_descendants(board_conn, "t_orphan_w") == []
+
+    def test_diamond_shape_dedups_descendant(self, board_conn) -> None:
+        """Reviewer-flagged gap: diamond shape (umb → A → C,
+        umb → B → C) must return C exactly once. sqlite's UNION dedups
+        in the recursive CTE."""
+        from hermes_cli.kanban_db import _v6_7_walk_descendants
+        _mk_task(board_conn, "t_di_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_di_a", assignee="friday", status="done")
+        _mk_task(board_conn, "t_di_b", assignee="shuri", status="done")
+        _mk_task(board_conn, "t_di_c", assignee="tony", status="done")
+        _link(board_conn, "t_di_umb", "t_di_a")
+        _link(board_conn, "t_di_umb", "t_di_b")
+        _link(board_conn, "t_di_a", "t_di_c")
+        _link(board_conn, "t_di_b", "t_di_c")
+        board_conn.commit()
+        rows = _v6_7_walk_descendants(board_conn, "t_di_umb")
+        ids = [r["id"] for r in rows]
+        # C appears exactly once even though two paths reach it
+        assert ids.count("t_di_c") == 1
+        assert set(ids) == {"t_di_a", "t_di_b", "t_di_c"}
+
+    def test_deep_integrative_review_descendant_is_skipped(
+        self, board_conn,
+    ) -> None:
+        """Reviewer-flagged gap: with the transitive walk, an
+        integrative-review task that's deep in the descendant tree
+        (not a direct child) must still be skipped by the title-
+        prefix check in the gate's children iteration."""
+        _mk_task(board_conn, "t_dpir_umb", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_dpir_fr", assignee="friday", status="done")
+        _mk_task(board_conn, "t_dpir_tn", assignee="tony", status="done")
+        _link(board_conn, "t_dpir_umb", "t_dpir_fr")
+        _link(board_conn, "t_dpir_fr", "t_dpir_tn")
+        # An old integrative review hanging off Tony (deep, not direct)
+        _mk_task(
+            board_conn, "t_dpir_deep_ir",
+            assignee="tchalla", status="done",
+            title=_v6_7_integrative_title_for("t_dpir_umb"),
+        )
+        board_conn.execute(
+            "UPDATE tasks SET created_by = 'dispatcher' WHERE id = 't_dpir_deep_ir'",
+        )
+        _link(board_conn, "t_dpir_tn", "t_dpir_deep_ir")
+        board_conn.commit()
+        # The deep integ-review should be skipped in the gate's
+        # has_review_child / has_non_review_child counting (it's an
+        # artifact of #30, not a per-block review).
+        # Since the integrative-review lookup also finds it (created_by
+        # dispatcher, matching title), archive should evaluate the
+        # existing review's verdict path. Stub a reject so we get a
+        # spawn attempt rather than a noop.
+        board_conn.execute(
+            "UPDATE tasks SET result = 'verdict: reject' WHERE id = 't_dpir_deep_ir'",
+        )
+        board_conn.commit()
+        # No infinite loop, gate evaluates cleanly.
+        result = archive_task(board_conn, "t_dpir_umb")
+        # Either spawns a new (round 2) review or blocks — both False
+        assert result is False
+
+    def test_shared_descendant_across_umbrellas_documented(
+        self, board_conn,
+    ) -> None:
+        """Reviewer-flagged gap: the schema allows a task to have
+        multiple parents. If umbrella A and umbrella B share a
+        descendant, walking from either id returns the shared
+        descendant. This test pins the (accepted) behavior so
+        future readers don't get surprised."""
+        from hermes_cli.kanban_db import _v6_7_walk_descendants
+        _mk_task(board_conn, "t_sh_a", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_sh_b", goal_mode=True, status="running")
+        _mk_task(board_conn, "t_sh_shared", assignee="friday", status="done")
+        _link(board_conn, "t_sh_a", "t_sh_shared")
+        _link(board_conn, "t_sh_b", "t_sh_shared")
+        board_conn.commit()
+        rows_a = _v6_7_walk_descendants(board_conn, "t_sh_a")
+        rows_b = _v6_7_walk_descendants(board_conn, "t_sh_b")
+        # Both umbrellas see the shared descendant — multi-parent
+        # leakage is documented behavior. Real chains don't share
+        # live descendants across umbrellas, so this is acceptable.
+        assert "t_sh_shared" in {r["id"] for r in rows_a}
+        assert "t_sh_shared" in {r["id"] for r in rows_b}
