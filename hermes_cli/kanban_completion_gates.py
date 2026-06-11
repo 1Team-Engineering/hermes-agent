@@ -66,6 +66,13 @@ ROLE_RUNTIME_FLOORS_SECONDS: dict[str, int] = {
     "banner": 0,
 }
 
+# Role sets — referenced by the floor's honest-reject bypass (#74) and
+# the workspace-diff and reviewer-fields gates below. Hoisted here so
+# verify_runtime_floor can reference REVIEW_ROLES at call time without
+# forward-ref gymnastics.
+REVIEW_ROLES = {"tony", "tchalla", "vision", "reviewer"}
+ORCHESTRATION_ROLES = {"jarvis", "pepper", "banner"}
+
 
 @dataclass(frozen=True)
 class RuntimeFloorViolation:
@@ -92,6 +99,7 @@ def verify_runtime_floor(
     completed_at: int,
     *,
     allow_below_floor: bool = False,
+    is_honest_reject: bool = False,
 ) -> Optional[RuntimeFloorViolation]:
     """Return a violation if the worker's runtime is below its role floor.
 
@@ -101,12 +109,23 @@ def verify_runtime_floor(
 
     A floor of 0 (or an unknown assignee, or a missing ``started_at``) is a
     pass — we never invent floors for roles we don't know.
+
+    ``is_honest_reject=True`` is a bypass for review-role tasks that
+    are completing with ``verdict: reject``. Closes hermes-jarvis#74:
+    the floor was designed against rubber-stamp APPROVES; penalizing
+    accurate fast rejects creates pressure to either fake-pad time or
+    rubber-stamp-approve, neither of which is good. Build/orchestration
+    roles get no bypass — a 60-second "implementation" that ends in
+    reject still warrants the floor.
     """
     if allow_below_floor:
         return None
     if not assignee or started_at is None:
         return None
-    floor = ROLE_RUNTIME_FLOORS_SECONDS.get(assignee.lower())
+    role = assignee.lower()
+    if is_honest_reject and role in REVIEW_ROLES:
+        return None
+    floor = ROLE_RUNTIME_FLOORS_SECONDS.get(role)
     if not floor:
         return None
     actual = max(0, completed_at - int(started_at))
@@ -121,9 +140,6 @@ def verify_runtime_floor(
 # =====================================================================
 # Workspace-diff gate (#62)
 # =====================================================================
-
-REVIEW_ROLES = {"tony", "tchalla", "vision", "reviewer"}
-ORCHESTRATION_ROLES = {"jarvis", "pepper", "banner"}
 
 
 @dataclass(frozen=True)
@@ -589,6 +605,13 @@ def _has_adversarial_structure(text: str) -> bool:
 # Empty-marker tokens accepted as honest declarations.
 _HONEST_EMPTY_MARKERS = {"none", "[]", "{}", "n/a"}
 
+# hermes-jarvis#75: bullet form of honest-empty for test_quality.evidence.
+# The reason must be ≥8 chars (non-whitespace), mirroring the
+# ``not_applicable`` shape already accepted for imports_match.
+_BULLET_NOT_APPLICABLE_RE = re.compile(
+    r"(?mi)^\s*-\s*not_applicable\s*:\s*(\S.{6,})\s*$",
+)
+
 
 def _adversarial_value_substantive(captured: str) -> bool:
     """True if an adversarial_pass.* value's content shows the reviewer
@@ -656,6 +679,12 @@ def _field_present(field_key: str, text: str, *, code_change_context: bool = Fal
             return False
         head = body.strip().split("\n", 1)[0].strip().lower()
         if head in _HONEST_EMPTY_MARKERS:
+            return not code_change_context
+        # hermes-jarvis#75: accept ``- not_applicable: <≥8 char reason>``
+        # as a bullet equivalent of the inline honest-empty markers.
+        # Same code_change_context rule applies — code-touching reviews
+        # must produce real citations, not honest-empty escapes.
+        if _BULLET_NOT_APPLICABLE_RE.search(body):
             return not code_change_context
         return bool(_EVIDENCE_CITATION_RE.search(body))
 

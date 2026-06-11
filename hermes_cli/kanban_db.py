@@ -3678,12 +3678,18 @@ def _v6_7_run_completion_gates(
     no_reviewer_fields = no_rf_reason is not None
     phantom_ok = phantom_ok_reason is not None
     doc_drift_ok = doc_drift_reason is not None
+    # hermes-jarvis#74: honest-reject completion bypasses the floor for
+    # reviewers. Parsing the verdict here once so both the floor gate
+    # and any future gate can use it.
+    parsed_verdict = _v6_7_parse_verdict(result)
+    is_honest_reject = parsed_verdict == "reject"
     violations: list = []
     floor = verify_runtime_floor(
         assignee=row["assignee"],
         started_at=row["started_at"],
         completed_at=now,
         allow_below_floor=fast_ok,
+        is_honest_reject=is_honest_reject,
     )
     if floor is not None:
         violations.append(floor)
