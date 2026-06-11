@@ -98,6 +98,7 @@ from hermes_cli.kanban_completion_gates import (
     verify_pr_urls_exist,
     verify_reviewer_fields,
     verify_runtime_floor,
+    verify_umbrella_review_coverage,
     verify_workspace_diff,
 )
 
@@ -3673,7 +3674,7 @@ def _v6_7_run_completion_gates(
         - ``x_no_reviewer_fields`` — skip reviewer-fields (#29, #31)
     """
     row = conn.execute(
-        "SELECT assignee, body, tenant, workspace_kind, workspace_path, started_at "
+        "SELECT assignee, body, tenant, workspace_kind, workspace_path, started_at, goal_mode "
         "  FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -3686,6 +3687,11 @@ def _v6_7_run_completion_gates(
     no_rf_reason = _validate_opt_out(task_id, "x_no_reviewer_fields", md.get("x_no_reviewer_fields"))
     phantom_ok_reason = _validate_opt_out(task_id, "x_phantom_pr_ok", md.get("x_phantom_pr_ok"))
     doc_drift_reason = _validate_opt_out(task_id, "x_doc_drift_ok", md.get("x_doc_drift_ok"))
+    # hermes-jarvis#79: opt-out for goal-mode umbrellas that
+    # legitimately don't need any per-block review.
+    umbrella_no_review_reason = _validate_opt_out(
+        task_id, "x_umbrella_no_review", md.get("x_umbrella_no_review"),
+    )
     accepted_opt_outs = {
         k: v for k, v in (
             ("x_fast_justified", fast_ok_reason),
@@ -3694,6 +3700,7 @@ def _v6_7_run_completion_gates(
             ("x_no_reviewer_fields", no_rf_reason),
             ("x_phantom_pr_ok", phantom_ok_reason),
             ("x_doc_drift_ok", doc_drift_reason),
+            ("x_umbrella_no_review", umbrella_no_review_reason),
         ) if v is not None
     }
     if accepted_opt_outs:
@@ -3767,6 +3774,24 @@ def _v6_7_run_completion_gates(
     )
     if drift is not None:
         violations.append(drift)
+    # hermes-jarvis#79: goal-mode umbrellas must have at least one
+    # review-role descendant before they can complete. Reuses
+    # _v6_7_walk_descendants from #73 — keeps the transitive-walk
+    # behavior consistent across the integrative-review-at-archive
+    # gate (#30) and this complete-time check.
+    no_review_needed = umbrella_no_review_reason is not None
+    is_goal_mode = bool(row["goal_mode"])
+    if is_goal_mode and not no_review_needed:
+        descendants = _v6_7_walk_descendants(conn, task_id)
+        umbrella_review = verify_umbrella_review_coverage(
+            is_goal_mode=is_goal_mode,
+            umbrella_assignee=row["assignee"],
+            umbrella_id=task_id,
+            descendants=descendants,
+            allow_no_review_needed=no_review_needed,
+        )
+        if umbrella_review is not None:
+            violations.append(umbrella_review)
     return violations
 
 

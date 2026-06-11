@@ -11,11 +11,13 @@ Pattern mirrors the existing ``_verify_created_cards`` /
 state is unchanged on rejection and the worker can simply retry with corrected
 output.
 
-Three gates ship today (Tranche 1 of v6.7, closes #28, #62, #64):
+Gates so far (v6.7 + v6.8, closing #28, #62, #64, #73, #74, #77, #78, #79):
 
 1. :func:`verify_runtime_floor` — per-role floor on
    ``completed_at - started_at``. Catches Tony's 20-second "approve" verdicts
-   and Friday's 59-second "implemented 7 dispatcher gates" claims.
+   and Friday's 59-second "implemented 7 dispatcher gates" claims. v6.8
+   adds an honest-reject bypass (#74) and progressive message escalation
+   (#77/#78) so workers stop bare-retrying the same payload.
 
 2. :func:`verify_workspace_diff` — when a non-review worker on a
    ``dir`` / ``worktree`` workspace claims to have produced code, the workspace
@@ -27,6 +29,18 @@ Three gates ship today (Tranche 1 of v6.7, closes #28, #62, #64):
    (``*evidence*``, ``commit-hash*``, ``triage/*``, ``tmp-*``, and tracked
    files with no extension and no shebang — the "all prior block evidence
    files" failure mode).
+
+4. :func:`verify_reviewer_fields` — reviewers must produce a structured
+   ``verdict:`` line plus the supporting evidence / test_quality bullets
+   before completion writes. v6.8 accepts bullet-form ``not_applicable``
+   with a ≥20-char reason.
+
+5. :func:`verify_umbrella_review_coverage` (#79) — a goal-mode task
+   assigned to an orchestration role (jarvis / pepper / banner) cannot
+   complete until at least one review-role descendant exists somewhere
+   in its transitive subtree. Forces the umbrella to keep_running until
+   reviewers spawn — prevents the 2026-06-10 "JARVIS spawns Pepper +
+   Friday then approves itself before any reviewer queues" case.
 
 See hermes-jarvis#61 for the bootstrap-paradox case study that motivates
 these gates.
@@ -1047,6 +1061,127 @@ def verify_doc_drift(
     return DocDriftViolation(
         active_version=active_str,
         stale_refs=tuple(stale),
+    )
+
+
+# =====================================================================
+# Umbrella review-coverage gate (#79)
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class MissingUmbrellaReviewViolation:
+    umbrella_id: str
+    has_non_review_descendant: bool
+
+    def message(self) -> str:
+        if not self.has_non_review_descendant:
+            # Pathological: a goal-mode umbrella with no descendants
+            # at all. The orchestrator never decomposed.
+            return (
+                f"umbrella-review-coverage: this goal-mode umbrella "
+                f"({self.umbrella_id}) has no descendants at all. "
+                f"A `--goal` umbrella that completes without ever "
+                f"spawning child tasks is almost always a misfire — "
+                f"either decompose the work into children first, or, "
+                f"if this umbrella legitimately has no actionable "
+                f"sub-tasks, set "
+                f"metadata={{\"x_umbrella_no_review\": \"<≥20-char "
+                f"reason — e.g. 'pure status-only ack of upstream "
+                f"completion'>\"}}."
+            )
+        return (
+            f"umbrella-review-coverage: this goal-mode umbrella "
+            f"({self.umbrella_id}) has build-role descendants but NO "
+            f"review-role descendants (tony / tchalla / vision / "
+            f"reviewer) anywhere in its task_links subtree. "
+            f"Marvel-swarm chains call for at least one per-block "
+            f"review before the umbrella archives. Either spawn the "
+            f"review task(s) now via kanban_create (--parent <build-"
+            f"task-id> --assignee tony/tchalla/vision), THEN re-call "
+            f"kanban_complete, or — if this work genuinely doesn't "
+            f"need review (rare; usually a misfire) — set "
+            f"metadata={{\"x_umbrella_no_review\": \"<≥20-char "
+            f"reason>\"}}.\n"
+            f"This catches the 2026-06-10 validation case where JARVIS "
+            f"spawned Pepper+Friday and exited done without queuing "
+            f"any reviewer, leaving Kaipo to hand-spawn the rest of "
+            f"the chain. See hermes-jarvis#79."
+        )
+
+
+def verify_umbrella_review_coverage(
+    is_goal_mode: bool,
+    umbrella_assignee: Optional[str],
+    umbrella_id: str,
+    descendants: list,  # rows from _v6_7_walk_descendants
+    *,
+    allow_no_review_needed: bool = False,
+) -> Optional[MissingUmbrellaReviewViolation]:
+    """Reject an orchestration umbrella's kanban_complete if its
+    descendant subtree contains no review-role tasks.
+
+    Closes hermes-jarvis#79. The 2026-06-10 v6.7 validation chain on
+    hermes-dashboard had JARVIS spawn Pepper + Friday from the
+    umbrella, then call kanban_complete on itself before any reviewer
+    was queued. The umbrella showed as done with build-only
+    descendants; Kaipo had to manually spawn Tony / Tchalla / Vision
+    to continue the chain. This gate forces orchestration umbrellas
+    to keep_running until at least one review task exists in their
+    subtree.
+
+    Skipped (returns None) when:
+    - The task is not goal_mode (avoids per-call CTE on the 99% case).
+    - The task's assignee is NOT in ORCHESTRATION_ROLES (i.e., a
+      goal-loop Friday/Tony/etc. shouldn't be subject to this
+      umbrella discipline — only JARVIS/Pepper/Banner).
+    - At least one descendant has a review-role assignee. **Status
+      doesn't matter** — a queued / blocked / running review still
+      proves the orchestrator decomposed correctly. The integrative-
+      review-at-archive gate (#30) handles terminal-status discipline
+      at the other end of the lifecycle.
+    - Opt-out via ``allow_no_review_needed=True``.
+
+    Differs from the v6.7 #30 integrative-review-at-archive gate:
+    - #30 fires at ARCHIVE time and spawns Tchalla after the chain
+      settles. The integrative review is intentionally NOT linked
+      into ``task_links`` (see ``_v6_7_spawn_integrative_review`` —
+      "Intentionally NO parents" to avoid the parents-not-done
+      deadlock), so it does NOT satisfy this #79 gate. #79 requires
+      a PER-BLOCK review (tony/tchalla/vision in the build subtree).
+    - #79 fires at COMPLETE time and forces JARVIS to spawn
+      reviewers BEFORE marking itself done — catching the empty-
+      chain misfire one step earlier in the orchestration lifecycle.
+    """
+    if allow_no_review_needed:
+        return None
+    if not is_goal_mode:
+        return None
+    # Self-review fix: tighten to orchestration roles only so a
+    # goal-loop Friday/Tony doesn't get caught by an umbrella gate.
+    # The 2026-06-10 case was specifically a JARVIS misfire.
+    if not umbrella_assignee or umbrella_assignee.lower() not in ORCHESTRATION_ROLES:
+        return None
+    if not descendants:
+        return MissingUmbrellaReviewViolation(
+            umbrella_id=umbrella_id, has_non_review_descendant=False,
+        )
+    has_review = False
+    for ch in descendants:
+        assignee = (ch["assignee"] or "").lower()
+        if assignee in REVIEW_ROLES:
+            has_review = True
+            break  # one is enough to satisfy the gate
+    if has_review:
+        return None
+    # No review descendants — fail. The umbrella does have other
+    # children; the message specializes between "no descendants at
+    # all" and "build-only descendants" based on count, not the
+    # has_non_review flag (which would lie if descendants were
+    # all empty-assignee entries).
+    return MissingUmbrellaReviewViolation(
+        umbrella_id=umbrella_id,
+        has_non_review_descendant=bool(descendants),
     )
 
 

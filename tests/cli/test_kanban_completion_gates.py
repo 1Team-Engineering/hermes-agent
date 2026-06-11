@@ -2152,3 +2152,323 @@ class TestProgressiveFloorSelfReviewGaps:
         # Should read "Wait 0s", not "Wait -5s"
         assert "Wait 0s" in msg or "Wait 0 " in msg
         assert "-" not in msg.split("Wait")[1].split("s")[0]
+
+
+# =====================================================================
+# hermes-jarvis#79 — umbrella review-coverage gate
+# =====================================================================
+
+
+class TestUmbrellaReviewCoverage:
+    """Unit tests for verify_umbrella_review_coverage (#79). The
+    function is pure — pass in descendants + is_goal_mode and it
+    returns a violation if the goal-mode umbrella has no review-role
+    descendants."""
+
+    @staticmethod
+    def _row(assignee, id_="x", status="done"):
+        # Simulate a sqlite3.Row-like mapping
+        return {"id": id_, "assignee": assignee, "status": status, "title": ""}
+
+    def test_non_goal_mode_skips(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=False, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert v is None
+
+    def test_goal_mode_with_review_descendant_passes(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[self._row("friday"), self._row("tony")],
+        )
+        assert v is None
+
+    def test_goal_mode_with_only_build_descendants_rejects(self) -> None:
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[self._row("friday"), self._row("pepper")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+        assert v.has_non_review_descendant is True
+        msg = v.message()
+        assert "no review-role descendants" in msg.lower() or "no review" in msg.lower()
+        # Body suggests the kanban_create command shape
+        assert "kanban_create" in msg
+
+    def test_goal_mode_with_no_descendants_rejects(self) -> None:
+        """A goal-mode umbrella that never spawned children is almost
+        always a misfire; gate forces decomposition or an explicit
+        opt-out."""
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+        assert v.has_non_review_descendant is False
+        assert "no descendants at all" in v.message()
+
+    def test_tchalla_descendant_satisfies_gate(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[self._row("friday"), self._row("tchalla")],
+        )
+        assert v is None
+
+    def test_vision_descendant_satisfies_gate(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[self._row("friday"), self._row("vision")],
+        )
+        assert v is None
+
+    def test_opt_out_bypasses_gate(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+            allow_no_review_needed=True,
+        )
+        assert v is None
+
+    # Scope tightening tests (self-review fix): gate applies ONLY to
+    # orchestration roles (jarvis/pepper/banner). Goal-mode workers
+    # like Friday are out of scope.
+
+    def test_friday_goal_mode_umbrella_skipped(self) -> None:
+        """A goal-mode task assigned to Friday should NOT be subject to
+        the umbrella-review gate — Friday is a worker, not an
+        orchestrator, and the review umbrella belongs to her parent."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="friday", umbrella_id="t_u",
+            descendants=[],
+        )
+        assert v is None
+
+    def test_tony_goal_mode_skipped(self) -> None:
+        """Review-role goal-mode tasks are also out of scope."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="tony", umbrella_id="t_u",
+            descendants=[],
+        )
+        assert v is None
+
+    def test_empty_assignee_skipped(self) -> None:
+        """Tasks with no assignee can't be an orchestration umbrella."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee=None, umbrella_id="t_u",
+            descendants=[],
+        )
+        assert v is None
+
+    def test_pepper_umbrella_in_scope(self) -> None:
+        """Pepper is an orchestration role — also subject to the gate."""
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="pepper", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+
+    def test_banner_umbrella_in_scope(self) -> None:
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="banner", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+
+    def test_assignee_case_insensitive(self) -> None:
+        """Assignee comparison is case-insensitive, matching the rest
+        of the gate module."""
+        from hermes_cli.kanban_completion_gates import (
+            MissingUmbrellaReviewViolation, verify_umbrella_review_coverage,
+        )
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="JARVIS", umbrella_id="t_u",
+            descendants=[self._row("friday")],
+        )
+        assert isinstance(v, MissingUmbrellaReviewViolation)
+
+    def test_review_in_blocked_status_still_counts(self) -> None:
+        """ANY review descendant satisfies the gate, regardless of
+        status (queued / running / blocked / done) — the gate is
+        about the *intent* to review, not the review's progress."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[
+                self._row("friday", status="done"),
+                self._row("tony", status="blocked"),
+            ],
+        )
+        assert v is None
+
+    def test_deep_transitive_review_descendant_counts(self) -> None:
+        """The transitive walk (#73) means a reviewer 4 levels deep
+        still satisfies the gate. This is a pure-function test — the
+        descendants list is already flattened by the caller."""
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[
+                self._row("friday", id_="t_c1"),
+                self._row("pepper", id_="t_c2"),
+                self._row("friday", id_="t_gc1"),
+                self._row("tchalla", id_="t_ggc1"),  # deep reviewer
+            ],
+        )
+        assert v is None
+
+    def test_multi_children_with_multiple_reviews_passes(self) -> None:
+        from hermes_cli.kanban_completion_gates import verify_umbrella_review_coverage
+        v = verify_umbrella_review_coverage(
+            is_goal_mode=True, umbrella_assignee="jarvis", umbrella_id="t_u",
+            descendants=[
+                self._row("friday"), self._row("shuri"),
+                self._row("tony"), self._row("tchalla"), self._row("vision"),
+            ],
+        )
+        assert v is None
+
+
+class TestUmbrellaReviewCoverageIntegration:
+    """End-to-end via complete_task. The 2026-06-10 case: JARVIS
+    spawned Pepper+Friday from the umbrella, then called
+    kanban_complete on itself before any reviewer was queued."""
+
+    @pytest.fixture
+    def umbrella_with_only_build(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        # Umbrella with goal_mode=1, started long ago so floor doesn't fire
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, goal_mode, "
+            "  started_at, created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_umb', 'umbrella', 'running', 'jarvis', 1, ?, ?, "
+            "        'scratch', NULL)",
+            (now - 1000, now),
+        )
+        # Friday child (build)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, goal_mode, "
+            "  started_at, created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_fr', 'Friday', 'done', 'friday', 0, ?, ?, "
+            "        'scratch', NULL)",
+            (now - 500, now),
+        )
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES ('t_umb', 't_fr')",
+        )
+        conn.commit()
+        yield conn
+        conn.close()
+
+    def test_jarvis_umbrella_blocks_without_review_descendant(
+        self, umbrella_with_only_build,
+    ) -> None:
+        """The 2026-06-10 case: build-only umbrella tries to complete.
+        Should be rejected by the new gate."""
+        with pytest.raises(kb.CompletionGateError) as excinfo:
+            kb.complete_task(
+                umbrella_with_only_build, "t_umb",
+                summary="decomposed",
+                result="Decomposed v6.7 widget chain into Pepper + Friday.",
+            )
+        kinds = {type(v).__name__ for v in excinfo.value.violations}
+        assert "MissingUmbrellaReviewViolation" in kinds
+
+    def test_jarvis_umbrella_passes_when_review_exists(
+        self, umbrella_with_only_build,
+    ) -> None:
+        """Once a tony descendant is added (whether as direct child
+        or chained off Friday), the gate passes."""
+        import time
+        # Chained tony off friday (the validation chain's actual shape)
+        umbrella_with_only_build.execute(
+            "INSERT INTO tasks (id, title, status, assignee, goal_mode, "
+            "  started_at, created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_tn', 'Tony', 'done', 'tony', 0, ?, ?, 'scratch', NULL)",
+            (int(time.time()) - 100, int(time.time())),
+        )
+        umbrella_with_only_build.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES ('t_fr', 't_tn')",
+        )
+        umbrella_with_only_build.commit()
+        ok = kb.complete_task(
+            umbrella_with_only_build, "t_umb",
+            summary="decomposed + reviewed",
+            result="All children terminal.",
+        )
+        assert ok
+
+    def test_x_umbrella_no_review_opt_out_passes(
+        self, umbrella_with_only_build,
+    ) -> None:
+        """An umbrella that legitimately doesn't need review can
+        opt out with an audit reason."""
+        ok = kb.complete_task(
+            umbrella_with_only_build, "t_umb",
+            summary="status ack",
+            result="Acknowledged upstream completion; no review needed.",
+            metadata={"x_umbrella_no_review":
+                      "pure status ack of upstream complete, no actionable subtasks"},
+        )
+        assert ok
+
+    def test_opt_out_with_short_reason_rejected(
+        self, umbrella_with_only_build,
+    ) -> None:
+        """Opt-out reason must be ≥20 chars like other v6.7/v6.8
+        opt-outs."""
+        with pytest.raises(kb.InvalidOptOutError):
+            kb.complete_task(
+                umbrella_with_only_build, "t_umb",
+                summary="x", result="x",
+                metadata={"x_umbrella_no_review": "ok"},
+            )
+
+    def test_non_goal_mode_task_unaffected(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A plain (non-goal_mode) task with no descendants completes
+        fine — the gate only fires on goal_mode umbrellas."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
+        conn = kb.connect(board="default")
+        import time
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, goal_mode, "
+            "  started_at, created_at, workspace_kind, workspace_path) "
+            "VALUES ('t_plain', 'plain', 'running', 'jarvis', 0, ?, ?, "
+            "        'scratch', NULL)",
+            (now - 1000, now),
+        )
+        conn.commit()
+        ok = kb.complete_task(
+            conn, "t_plain",
+            summary="done", result="all good",
+        )
+        assert ok
+        conn.close()
