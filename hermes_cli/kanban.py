@@ -384,6 +384,37 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- research-loop ---
+    # Thin CLI front door for the Banner↔Hulk iterative research loop.
+    # Hits POST /api/research-loop/dispatch on the hulk-dashboard, which
+    # already owns the orchestration: row creation, kanban tracking task
+    # via JARVIS, and out-of-band script invocation. CLI exists so
+    # operators + JARVIS can pick this pattern without needing the React
+    # dashboard. See plans/research-loop-audit.md for the friction this
+    # addresses.
+    p_research_loop = sub.add_parser(
+        "research-loop",
+        help="Dispatch a Banner↔Hulk iterative research loop on one question",
+    )
+    p_research_loop.add_argument(
+        "question",
+        help="The research question to drive the loop (one well-formed question)",
+    )
+    p_research_loop.add_argument("--max-iter", type=int, default=3,
+                                 help="Hard cap on iteration count (default: 3)")
+    p_research_loop.add_argument("--max-min", type=int, default=15,
+                                 help="Wall-clock budget in minutes (default: 15)")
+    p_research_loop.add_argument("--max-x", type=int, default=1,
+                                 help="Max X tool calls per iteration (default: 1)")
+    p_research_loop.add_argument("--question-source", default="",
+                                 help="Optional source path / reference for provenance")
+    p_research_loop.add_argument(
+        "--dashboard-url",
+        default="http://127.0.0.1:8892",
+        help="Hulk-dashboard base URL (default: http://127.0.0.1:8892)",
+    )
+    p_research_loop.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- list ---
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
     p_list.add_argument("--mine", action="store_true",
@@ -924,6 +955,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "init":     _cmd_init,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
+            "research-loop": _cmd_research_loop,
             "list":     _cmd_list,
             "ls":       _cmd_list,
             "show":     _cmd_show,
@@ -1395,6 +1427,75 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         print("Workers: " + ", ".join(created.worker_ids))
         print(f"Verifier: {created.verifier_id}")
         print(f"Synthesizer: {created.synthesizer_id}")
+    return 0
+
+
+def _cmd_research_loop(args: argparse.Namespace) -> int:
+    """Thin front door to POST /api/research-loop/dispatch on the
+    hulk-dashboard. The dashboard endpoint already owns row creation,
+    JARVIS-mediated kanban task creation, and out-of-band loop spawn.
+    See plans/research-loop-audit.md for why this CLI exists.
+    """
+    import urllib.error
+    import urllib.request
+
+    base = args.dashboard_url.rstrip("/")
+    url = f"{base}/api/research-loop/dispatch"
+    payload = json.dumps({
+        "question": args.question,
+        "question_source": args.question_source,
+        "max_iter": args.max_iter,
+        "max_min": args.max_min,
+        "max_x": args.max_x,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        print(
+            f"kanban research-loop: HTTP {exc.code} from {url}: {err_body[:500]}",
+            file=sys.stderr,
+        )
+        return 3
+    except urllib.error.URLError as exc:
+        print(
+            f"kanban research-loop: hulk-dashboard not reachable at {base} ({exc}). "
+            f"Start it with `launchctl start ai.hermes.hulk-dashboard` (port 8892) "
+            f"or pass --dashboard-url <url>.",
+            file=sys.stderr,
+        )
+        return 3
+    if getattr(args, "json", False):
+        print(json.dumps(body, indent=2, ensure_ascii=False))
+    else:
+        loop_id = body.get("loop_id", "?")
+        max_iter = body.get("max_iter", args.max_iter)
+        max_min = body.get("max_min", args.max_min)
+        max_x = body.get("max_x", args.max_x)
+        print(f"Dispatched research loop: {loop_id}")
+        print(f"  budget: {max_iter} iter × {max_min} min × {max_x} X-call/iter")
+        print(f"  question: {args.question[:120]}"
+              + ("…" if len(args.question) > 120 else ""))
+        print(f"  question_source: {args.question_source or '(none)'}")
+        print()
+        print("Track progress:")
+        print(f"  - Dashboard:  http://127.0.0.1:8890/research-loop  (loop_id {loop_id})")
+        print(f"  - Bundle:     ~/wiki/raw/research-bundles/<today>/<slug>.md")
+        print(f"  - Promoted study (when confidence ≥ 8): ~/wiki/studies/<slug>-deep-dive.md")
+        print()
+        print("A kanban task tracking this loop will be created by JARVIS shortly; "
+              "its id appears in the loop's `kanban_task_id` field. Use "
+              "`hermes kanban tail <task_id>` to watch live progress comments.")
     return 0
 
 
