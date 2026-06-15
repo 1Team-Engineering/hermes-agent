@@ -48,6 +48,88 @@ def test_build_task_header_preserves_spaces():
     assert "/path with space/x" in h
 
 
+def test_ensure_scope_spawns_if_missing(monkeypatch, tmp_path):
+    from agent.claude_code_relay_transport import ensure_scope, ScopeContext
+    import sqlite3
+    from hermes_cli.kanban_db import init_db, get_session
+
+    spawned = []
+    def fake_run(args, **kw):
+        spawned.append(args)
+        class R:
+            returncode = 0
+            stdout = "spawned: claude-test-x\n"
+            stderr = ""
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "agent.claude_code_relay_transport.tmux_session_alive",
+        lambda name: False,
+    )
+    monkeypatch.setattr(
+        "agent.claude_code_relay_transport._check_prereqs",
+        lambda: None,
+    )
+    # derive_project_root calls subprocess.check_output (git); stub it out
+    monkeypatch.setattr(
+        "agent.claude_code_relay_transport.derive_project_root",
+        lambda workspace: workspace,
+    )
+
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+
+    ctx = ScopeContext(profile="test", project="x", workspace=str(tmp_path))
+    ensure_scope(conn, ctx)
+
+    assert any("relay-spawn-scope.sh" in str(a) for a in spawned[0])
+    assert get_session(conn, "test-x") is not None
+
+
+def test_ensure_scope_noops_if_alive(monkeypatch, tmp_path):
+    from agent.claude_code_relay_transport import ensure_scope, ScopeContext
+    import sqlite3
+    from hermes_cli.kanban_db import init_db, upsert_session
+
+    called = []
+    def fake_run(*a, **kw):
+        called.append(a)
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "agent.claude_code_relay_transport.tmux_session_alive",
+        lambda name: True,
+    )
+    monkeypatch.setattr(
+        "agent.claude_code_relay_transport._check_prereqs",
+        lambda: None,
+    )
+
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+    upsert_session(conn, scope_slug="test-x", profile="test", project="x",
+                   tmux_session="claude-test-x", fifo_path="/tmp/f",
+                   mcp_config_path="/tmp/m", project_root=str(tmp_path),
+                   scope_cwd=str(tmp_path))
+    ctx = ScopeContext(profile="test", project="x", workspace=str(tmp_path))
+    ensure_scope(conn, ctx)  # should NOT spawn
+    spawn_calls = [a for a in called if a and len(a) > 0 and isinstance(a[0], list)
+                   and any("relay-spawn-scope" in str(x) for x in a[0])]
+    assert not spawn_calls
+
+
+def test_missing_binary_raises_provider_error(monkeypatch):
+    from agent.claude_code_relay_transport import _check_prereqs
+    from agent.claude_code_relay_helpers import ProviderError
+    monkeypatch.setattr("shutil.which", lambda b: None)
+    with pytest.raises(ProviderError, match="required binary"):
+        _check_prereqs()
+
+
 def test_provider_registered():
     import importlib
     import providers as _pmod
