@@ -46,3 +46,33 @@ def test_build_task_header_simple():
 def test_build_task_header_preserves_spaces():
     h = build_task_header(task_id="t_x", workspace="/path with space/x")
     assert "/path with space/x" in h
+
+
+def test_provider_registered():
+    import importlib
+    import providers as _pmod
+    # Reset discovery so importing the new plugin module takes effect
+    _pmod._discovered = False
+    _pmod._REGISTRY.pop("claude-code-relay", None)
+    _pmod._ALIASES.pop("ccr", None)
+
+    # Force-import the plugin module via importlib (mirrors _import_plugin_dir)
+    from pathlib import Path
+    plugin_init = (
+        Path(__file__).resolve().parent.parent
+        / "plugins" / "model-providers" / "claude-code-relay" / "__init__.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "plugins.model_providers.claude_code_relay",
+        plugin_init,
+        submodule_search_locations=[str(plugin_init.parent)],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules.pop("plugins.model_providers.claude_code_relay", None)
+    spec.loader.exec_module(mod)
+
+    from providers import get_provider_profile
+    profile = get_provider_profile("claude-code-relay")
+    assert profile is not None
+    assert profile.api_mode == "claude_code_relay"
