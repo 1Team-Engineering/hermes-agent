@@ -1049,7 +1049,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Which LLM/relay provider ran the task. "claude-code-relay" marks
+    -- tasks dispatched to a live Claude Code TUI session via the tmux
+    -- relay. NULL on legacy rows and on tasks that do not set a provider.
+    provider             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1578,6 +1582,7 @@ def init_db(
     """
     # Test-fixture shortcut: accept a raw connection as the first argument.
     if isinstance(db_path, sqlite3.Connection):
+        db_path.row_factory = sqlite3.Row
         db_path.executescript(SCHEMA_SQL)
         return None
     if db_path is not None:
@@ -1732,6 +1737,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # creation path that doesn't set the env var (CLI, dashboard).
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
+        )
+
+    if "provider" not in cols:
+        # Which LLM/relay provider ran the task. "claude-code-relay" marks
+        # tasks dispatched to a live Claude Code TUI session via the tmux
+        # relay. NULL on legacy rows (pre-relay) and on tasks that do not
+        # set a provider explicitly.
+        _add_column_if_missing(
+            conn, "tasks", "provider", "provider TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -4027,6 +4041,12 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    # B10: send /compact to the relay scope, if applicable. Errors are logged
+    # and never block the caller.
+    try:
+        _maybe_run_post_task_compact(conn, task_id)
+    except Exception:
+        pass
     return True
 
 
@@ -4509,7 +4529,12 @@ def block_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
-        return True
+    # B10: send /compact to the relay scope, if applicable. Errors never block.
+    try:
+        _maybe_run_post_task_compact(conn, task_id)
+    except Exception:
+        pass
+    return True
 
 
 
@@ -8631,3 +8656,65 @@ def list_idle_sessions(
         "SELECT * FROM task_sessions WHERE last_used_at < ?", (cutoff,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Relay /compact hook
+# ---------------------------------------------------------------------------
+
+_RELAY_BIN_TASK_HOOK = Path.home() / ".hermes" / "scripts" / "tmux-relay" / "bin"
+
+
+def _run_relay_compact(scope_slug: str) -> None:
+    """Send /compact to a relay scope.
+
+    B10: failures are logged but never propagated — a /compact error must
+    not block task completion or the next task dispatch.
+    """
+    try:
+        subprocess.run(
+            [str(_RELAY_BIN_TASK_HOOK / "relay-send.sh"), scope_slug, "/compact"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        _log.warning("/compact failed for scope %s", scope_slug)
+
+
+def _maybe_run_post_task_compact(conn: sqlite3.Connection, task_id: str) -> None:
+    """If the completed/blocked task ran under the relay provider, send /compact.
+
+    Derives the scope slug from (assignee, workspace_kind/workspace_path),
+    checks a matching task_sessions row exists, then calls _run_relay_compact.
+    Records last_compacted_at on success; silently ignores any error so this
+    function is always safe to call from a completion path.
+
+    Uses positional column access to avoid mutating conn.row_factory on a
+    shared connection (which would break other callers that expect plain tuples).
+    """
+    row = conn.execute(
+        "SELECT assignee, workspace_kind, provider, workspace_path"
+        " FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return
+    assignee, workspace_kind, provider, workspace_path = row[0], row[1], row[2], row[3]
+
+    if provider != "claude-code-relay":
+        return
+
+    if workspace_kind == "scratch":
+        project = "scratch"
+    else:
+        try:
+            from agent.claude_code_relay_helpers import derive_project
+            project = derive_project(workspace_path or "")
+        except Exception:
+            return
+
+    slug = f"{assignee}-{project}"
+    _run_relay_compact(slug)
+    try:
+        mark_compacted(conn, slug)
+    except Exception:
+        pass
