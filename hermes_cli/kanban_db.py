@@ -1147,6 +1147,27 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Relay scope tracker: maps a (profile, project) pair to its live tmux
+-- session, FIFO path, MCP config path, and workdir. One row per scope;
+-- upserted each time the relay spawns or re-attaches.
+CREATE TABLE IF NOT EXISTS task_sessions (
+    scope_slug          TEXT PRIMARY KEY,
+    profile             TEXT NOT NULL,
+    project             TEXT NOT NULL,
+    tmux_session        TEXT NOT NULL,
+    claude_session_id   TEXT,
+    fifo_path           TEXT NOT NULL,
+    mcp_config_path     TEXT NOT NULL,
+    project_root        TEXT NOT NULL,
+    scope_cwd           TEXT NOT NULL,
+    task_count          INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    last_used_at        INTEGER NOT NULL,
+    last_compacted_at   INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_sessions_last_used ON task_sessions(last_used_at);
 """
 
 
@@ -1540,7 +1561,7 @@ def init_db(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> Path:
+) -> Optional[Path]:
     """Create the schema if it doesn't exist; return the path used.
 
     Kept as a public entry point so CLI ``hermes kanban init`` and the
@@ -1550,7 +1571,15 @@ def init_db(
     may have drifted — tests that write legacy event kinds directly,
     external tools that upgrade an old DB file — can call this to
     force re-migration.
+
+    As a convenience for test fixtures, *db_path* may also be a
+    ``sqlite3.Connection`` (e.g. ``:memory:``).  In that case the schema
+    is applied directly to the supplied connection and ``None`` is returned.
     """
+    # Test-fixture shortcut: accept a raw connection as the first argument.
+    if isinstance(db_path, sqlite3.Connection):
+        db_path.executescript(SCHEMA_SQL)
+        return None
     if db_path is not None:
         path = db_path
     else:
@@ -8503,3 +8532,102 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# task_sessions helpers (relay scope tracking — #113)
+# ---------------------------------------------------------------------------
+
+
+def upsert_session(
+    conn: sqlite3.Connection,
+    *,
+    scope_slug: str,
+    profile: str,
+    project: str,
+    tmux_session: str,
+    fifo_path: str,
+    mcp_config_path: str,
+    project_root: str,
+    scope_cwd: str,
+    claude_session_id: Optional[str] = None,
+) -> None:
+    """Insert or update a relay scope row in ``task_sessions``."""
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO task_sessions
+              (scope_slug, profile, project, tmux_session, claude_session_id,
+               fifo_path, mcp_config_path, project_root, scope_cwd,
+               task_count, created_at, last_used_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(scope_slug) DO UPDATE SET
+              tmux_session      = excluded.tmux_session,
+              claude_session_id = COALESCE(excluded.claude_session_id,
+                                           task_sessions.claude_session_id),
+              fifo_path         = excluded.fifo_path,
+              mcp_config_path   = excluded.mcp_config_path,
+              project_root      = excluded.project_root,
+              scope_cwd         = excluded.scope_cwd,
+              last_used_at      = excluded.last_used_at
+            """,
+            (
+                scope_slug, profile, project, tmux_session, claude_session_id,
+                fifo_path, mcp_config_path, project_root, scope_cwd,
+                now, now,
+            ),
+        )
+
+
+def get_session(
+    conn: sqlite3.Connection, scope_slug: str
+) -> Optional[dict]:
+    """Return a single ``task_sessions`` row as a dict, or ``None``."""
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM task_sessions WHERE scope_slug = ?", (scope_slug,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def touch_session(conn: sqlite3.Connection, scope_slug: str) -> None:
+    """Bump ``last_used_at`` and increment ``task_count``."""
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_sessions "
+            "SET last_used_at = ?, task_count = task_count + 1 "
+            "WHERE scope_slug = ?",
+            (now, scope_slug),
+        )
+
+
+def mark_compacted(conn: sqlite3.Connection, scope_slug: str) -> None:
+    """Record the timestamp of the most recent /compact call."""
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_sessions SET last_compacted_at = ? WHERE scope_slug = ?",
+            (now, scope_slug),
+        )
+
+
+def evict_session(conn: sqlite3.Connection, scope_slug: str) -> None:
+    """Delete a relay scope row (called when the tmux session is torn down)."""
+    with write_txn(conn):
+        conn.execute(
+            "DELETE FROM task_sessions WHERE scope_slug = ?", (scope_slug,)
+        )
+
+
+def list_idle_sessions(
+    conn: sqlite3.Connection, threshold_secs: int
+) -> list[dict]:
+    """Return sessions whose ``last_used_at`` is older than *threshold_secs*."""
+    cutoff = int(time.time()) - threshold_secs
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM task_sessions WHERE last_used_at < ?", (cutoff,)
+    ).fetchall()
+    return [dict(r) for r in rows]
