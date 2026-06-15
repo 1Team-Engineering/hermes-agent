@@ -130,6 +130,33 @@ def test_missing_binary_raises_provider_error(monkeypatch):
         _check_prereqs()
 
 
+def test_chat_completion_returns_openai_shape(monkeypatch, tmp_path):
+    from agent.claude_code_relay_transport import chat_completion
+    import sqlite3
+    from hermes_cli.kanban_db import init_db
+
+    monkeypatch.setattr(
+        "agent.claude_code_relay_transport.send_turn",
+        lambda conn, ctx, *, task_id, user_text, timeout=300: "answer text",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+
+    resp = chat_completion(
+        conn,
+        messages=[{"role": "user", "content": "hi"}],
+        model="sonnet",
+        profile="test", project="x",
+        workspace=str(tmp_path), task_id="t_test",
+    )
+    assert resp["choices"][0]["message"]["role"] == "assistant"
+    assert resp["choices"][0]["message"]["content"] == "answer text"
+    assert resp["choices"][0]["finish_reason"] == "stop"
+    assert resp["model"] == "sonnet"
+    assert resp["object"] == "chat.completion"
+
+
 def test_provider_registered():
     import importlib
     import providers as _pmod
