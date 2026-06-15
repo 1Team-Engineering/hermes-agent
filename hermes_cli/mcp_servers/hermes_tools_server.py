@@ -134,7 +134,7 @@ def handle_initialize(req: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Handler: tools/list
+# Handler: tools/list  [Task 6]
 # ---------------------------------------------------------------------------
 
 def handle_tools_list(req: dict) -> str:
