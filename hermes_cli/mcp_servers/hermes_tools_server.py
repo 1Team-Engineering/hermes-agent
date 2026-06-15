@@ -162,7 +162,7 @@ def handle_tools_list(req: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Handler: tools/call
+# Handler: tools/call  [Task 7]
 # ---------------------------------------------------------------------------
 
 def _call_hermes_set_task(args: dict) -> dict:
