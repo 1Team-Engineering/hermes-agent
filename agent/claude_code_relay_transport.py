@@ -73,6 +73,38 @@ def _write_mcp_config(ctx: ScopeContext) -> Path:
     return path
 
 
+def _check_stop_hook(path: str | None = None) -> None:
+    """Verify the Hermes Stop hook is installed in claude settings.
+
+    B3: Stop hook is the per-turn end signal. Without it, relay-send.sh
+    hangs waiting for FIFO writes that never happen. Fail loud at boot
+    instead of silently timing out per turn.
+    """
+    path = path or os.path.expanduser("~/.claude/settings.json")
+    if not os.path.exists(path):
+        raise ProviderError(
+            f"claude settings.json not found at {path}. "
+            "Run scripts/tmux-relay/install-hook.sh to install the Stop hook."
+        )
+    with open(path) as f:
+        data = json.load(f)
+    hooks = data.get("hooks", {}).get("Stop", [])
+    found = False
+    for stop in hooks:
+        for h in (stop.get("hooks") or []):
+            cmd = h.get("command", "")
+            if "HERMES_RELAY_FIFO" in cmd:
+                found = True
+                break
+        if found:
+            break
+    if not found:
+        raise ProviderError(
+            "claude settings.json missing the Hermes Stop hook. "
+            "Run scripts/tmux-relay/install-hook.sh to install it."
+        )
+
+
 def _check_prereqs() -> None:
     """Fail loud if claude/tmux are missing (B2)."""
     for b in ("claude", "tmux"):
@@ -80,6 +112,7 @@ def _check_prereqs() -> None:
             raise ProviderError(f"required binary not found: {b}")
     if not (RELAY_BIN / "relay-spawn-scope.sh").exists():
         raise ProviderError(f"relay scripts missing at {RELAY_BIN}")
+    _check_stop_hook()  # B3: Stop hook required for FIFO turn-end signalling
 
 
 def ensure_scope(conn, ctx: ScopeContext) -> None:

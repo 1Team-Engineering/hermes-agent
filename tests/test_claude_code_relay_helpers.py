@@ -157,6 +157,33 @@ def test_chat_completion_returns_openai_shape(monkeypatch, tmp_path):
     assert resp["object"] == "chat.completion"
 
 
+def test_stop_hook_missing_raises_provider_error(monkeypatch, tmp_path):
+    from agent.claude_code_relay_transport import _check_stop_hook
+    from agent.claude_code_relay_helpers import ProviderError
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"hooks":{}}')
+    with pytest.raises(ProviderError, match="Stop hook"):
+        _check_stop_hook(str(settings))
+
+
+def test_stop_hook_present_passes(tmp_path):
+    from agent.claude_code_relay_transport import _check_stop_hook
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"hooks":{"Stop":[{"hooks":[{"type":"command",'
+        '"command":"echo done > $HERMES_RELAY_FIFO"}]}]}}'
+    )
+    _check_stop_hook(str(settings))  # no raise
+
+
+def test_stop_hook_settings_missing_raises(tmp_path):
+    from agent.claude_code_relay_transport import _check_stop_hook
+    from agent.claude_code_relay_helpers import ProviderError
+    nonexistent = tmp_path / "does-not-exist.json"
+    with pytest.raises(ProviderError, match="settings.json"):
+        _check_stop_hook(str(nonexistent))
+
+
 def test_provider_registered():
     import importlib
     import providers as _pmod
