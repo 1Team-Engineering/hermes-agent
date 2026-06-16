@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Entry-point shim that delegates to hermes_cli.mcp_servers.hermes_tools_server."""
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT))
+
+from hermes_cli.mcp_servers.hermes_tools_server import main
+
+if __name__ == "__main__":
+    main()
