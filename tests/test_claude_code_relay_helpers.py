@@ -184,6 +184,18 @@ def test_stop_hook_settings_missing_raises(tmp_path):
         _check_stop_hook(str(nonexistent))
 
 
+def test_mcp_config_is_chmod_600(tmp_path):
+    from agent.claude_code_relay_transport import _write_mcp_config, ScopeContext
+    ctx = ScopeContext(profile="friday", project="cv", workspace=str(tmp_path))
+    p = _write_mcp_config(ctx)
+    try:
+        mode = oct(p.stat().st_mode & 0o777)
+        assert mode == "0o600", f"expected 0o600, got {mode}"
+    finally:
+        if p.exists():
+            p.unlink()
+
+
 def test_scope_context_rejects_path_traversal_in_profile():
     from agent.claude_code_relay_transport import ScopeContext
     from agent.claude_code_relay_helpers import ProviderError

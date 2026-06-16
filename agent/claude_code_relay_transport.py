@@ -84,6 +84,7 @@ def _write_mcp_config(ctx: ScopeContext) -> Path:
         }
     }
     path.write_text(json.dumps(config))
+    os.chmod(path, 0o600)  # B7-adjacent: don't leak workspace paths to other users on /tmp
     return path
 
 
