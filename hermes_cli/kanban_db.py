@@ -8662,7 +8662,10 @@ def list_idle_sessions(
 # Relay /compact hook
 # ---------------------------------------------------------------------------
 
-_RELAY_BIN_TASK_HOOK = Path.home() / ".hermes" / "scripts" / "tmux-relay" / "bin"
+_RELAY_BIN_TASK_HOOK = Path(os.environ.get(
+    "HERMES_RELAY_BIN",
+    str(Path.home() / ".hermes" / "scripts" / "tmux-relay" / "bin"),
+))
 
 
 def _run_relay_compact(scope_slug: str) -> None:
