@@ -184,6 +184,26 @@ def test_stop_hook_settings_missing_raises(tmp_path):
         _check_stop_hook(str(nonexistent))
 
 
+def test_scope_context_rejects_path_traversal_in_profile():
+    from agent.claude_code_relay_transport import ScopeContext
+    from agent.claude_code_relay_helpers import ProviderError
+    with pytest.raises(ProviderError, match="invalid profile"):
+        ScopeContext(profile="../evil", project="x", workspace="/tmp")
+
+
+def test_scope_context_rejects_slash_in_project():
+    from agent.claude_code_relay_transport import ScopeContext
+    from agent.claude_code_relay_helpers import ProviderError
+    with pytest.raises(ProviderError, match="invalid project"):
+        ScopeContext(profile="friday", project="a/b", workspace="/tmp")
+
+
+def test_scope_context_accepts_valid_names():
+    from agent.claude_code_relay_transport import ScopeContext
+    ctx = ScopeContext(profile="friday", project="hermes-agent_v2", workspace="/tmp")
+    assert ctx.slug == "friday-hermes-agent_v2"
+
+
 def test_provider_registered():
     import importlib
     import providers as _pmod

@@ -7,12 +7,18 @@ ChatCompletion responses to upstream Hermes agent loops.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+_SCOPE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 from agent.claude_code_relay_helpers import (
     ProviderError,
@@ -40,6 +46,14 @@ class ScopeContext:
     profile: str
     project: str
     workspace: str
+
+    def __post_init__(self) -> None:
+        for field_name, value in (("profile", self.profile), ("project", self.project)):
+            if not _SCOPE_NAME_RE.match(value):
+                raise ProviderError(
+                    f"invalid {field_name} {value!r}: must match ^[a-zA-Z0-9_-]+$ "
+                    f"(B8: scope-name collision / path-traversal guard)"
+                )
 
     @property
     def slug(self) -> str:
