@@ -177,7 +177,12 @@ def send_turn(conn, ctx: ScopeContext, *, task_id: str, user_text: str,
         [str(RELAY_BIN / "relay-send.sh"), ctx.slug, prompt],
         capture_output=True, text=True, timeout=timeout,
     )
-    if r.returncode not in (0, 4):  # 4 = Stop-hook timeout (partial OK)
+    if r.returncode == 4:
+        log.warning(
+            "relay-send returned exit 4 (Stop-hook timeout) for scope %s — "
+            "response may be partial", ctx.slug,
+        )
+    elif r.returncode != 0:
         raise ProviderError(f"relay-send.sh exit {r.returncode}: {r.stderr}")
     touch_session(conn, ctx.slug)
     return r.stdout
